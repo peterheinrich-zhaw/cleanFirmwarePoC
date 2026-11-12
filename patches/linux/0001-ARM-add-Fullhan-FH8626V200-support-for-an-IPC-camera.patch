@@ -1,0 +1,4988 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Peter Heinrich <heip@zhaw.ch>
+Date: Thu, 12 Nov 2026 01:00:05 -0800
+Subject: [PATCH] ARM: add Fullhan FH8626V200 support for an IPC camera board
+
+Board support for a pan/tilt Wi-Fi camera with the Fullhan FH8626V200
+SoC (single Cortex-A7), written against Linux 6.18:
+
+- mach-fh8626 machine support and the fullhan/fh8626v200 device tree
+  (UART, GIC, timers, pinctrl-single mux, GPIO, I2C0, SPI NOR, USB,
+  camera pipeline, actuators)
+- clk-fh8626: PMU clock provider with the PLL and gate clocks
+- phy-fh8626-usb: USB 2.0 PHY driver for the DWC2 host
+  (the SV6355 Wi-Fi module sits on internal USB)
+- sc2336: SmartSens SC2336 1080p sensor driver over 2-lane MIPI CSI-2,
+  with streaming, exposure and gain controls
+- fh8626-camera: V4L2 capture driver for the MIPI/ISP/VPU pipeline,
+  with auto exposure, auto white balance, saturation control and
+  MJPEG output from the on-chip JPEG encoder; fh8626-isp-bringup
+  holds the ISP bring-up helpers
+- gpio-stepper: GPIO unipolar stepper motor driver (pan, tilt)
+- gpio-ircut: GPIO latching IR-cut filter driver
+- fh8626_defconfig
+
+No vendor code or vendor tuning data is used. Register layouts come
+from analysis of the hardware and the stock firmware, see the project
+documentation.
+
+Signed-off-by: Peter Heinrich <heip@zhaw.ch>
+---
+ .../devicetree/bindings/vendor-prefixes.yaml  |    2 +
+ arch/arm/Kconfig                              |    2 +
+ arch/arm/Makefile                             |    1 +
+ arch/arm/boot/dts/Makefile                    |    1 +
+ arch/arm/boot/dts/fullhan/Makefile            |    1 +
+ arch/arm/boot/dts/fullhan/fh8626v200.dts      |  395 ++++
+ arch/arm/configs/fh8626_defconfig             |   53 +
+ arch/arm/mach-fh8626/Kconfig                  |   11 +
+ arch/arm/mach-fh8626/Makefile                 |    1 +
+ arch/arm/mach-fh8626/fh8626.c                 |   57 +
+ drivers/clk/Kconfig                           |    9 +
+ drivers/clk/Makefile                          |    1 +
+ drivers/clk/clk-fh8626.c                      |  300 +++
+ drivers/media/i2c/Kconfig                     |   12 +
+ drivers/media/i2c/Makefile                    |    1 +
+ drivers/media/i2c/sc2336.c                    |  780 ++++++++
+ drivers/media/platform/Kconfig                |    1 +
+ drivers/media/platform/Makefile               |    1 +
+ drivers/media/platform/fullhan/Kconfig        |   32 +
+ drivers/media/platform/fullhan/Makefile       |    3 +
+ .../media/platform/fullhan/fh8626-camera.c    | 1767 +++++++++++++++++
+ .../platform/fullhan/fh8626-isp-bringup.c     |  455 +++++
+ drivers/misc/Kconfig                          |   15 +
+ drivers/misc/Makefile                         |    2 +
+ drivers/misc/gpio-ircut.c                     |  114 ++
+ drivers/misc/gpio-stepper.c                   |  452 +++++
+ drivers/phy/Kconfig                           |   11 +
+ drivers/phy/Makefile                          |    1 +
+ drivers/phy/phy-fh8626-usb.c                  |  173 ++
+ .../dt-bindings/clock/fullhan,fh8626-pmu.h    |   14 +
+ 30 files changed, 4668 insertions(+)
+ create mode 100644 arch/arm/boot/dts/fullhan/Makefile
+ create mode 100644 arch/arm/boot/dts/fullhan/fh8626v200.dts
+ create mode 100644 arch/arm/configs/fh8626_defconfig
+ create mode 100644 arch/arm/mach-fh8626/Kconfig
+ create mode 100644 arch/arm/mach-fh8626/Makefile
+ create mode 100644 arch/arm/mach-fh8626/fh8626.c
+ create mode 100644 drivers/clk/clk-fh8626.c
+ create mode 100644 drivers/media/i2c/sc2336.c
+ create mode 100644 drivers/media/platform/fullhan/Kconfig
+ create mode 100644 drivers/media/platform/fullhan/Makefile
+ create mode 100644 drivers/media/platform/fullhan/fh8626-camera.c
+ create mode 100644 drivers/media/platform/fullhan/fh8626-isp-bringup.c
+ create mode 100644 drivers/misc/gpio-ircut.c
+ create mode 100644 drivers/misc/gpio-stepper.c
+ create mode 100644 drivers/phy/phy-fh8626-usb.c
+ create mode 100644 include/dt-bindings/clock/fullhan,fh8626-pmu.h
+
+diff --git a/Documentation/devicetree/bindings/vendor-prefixes.yaml b/Documentation/devicetree/bindings/vendor-prefixes.yaml
+index a9cf85f..9d29da6 100644
+--- a/Documentation/devicetree/bindings/vendor-prefixes.yaml
++++ b/Documentation/devicetree/bindings/vendor-prefixes.yaml
+@@ -1489,6 +1489,8 @@ patternProperties:
+     description: SmartLabs LLC
+   "^smartrg,.*":
+     description: SmartRG, Inc.
++  "^smartsens,.*":
++    description: SmartSens Technology Co., Ltd.
+   "^smi,.*":
+     description: Silicon Motion Technology Corporation
+   "^smsc,.*":
+diff --git a/arch/arm/Kconfig b/arch/arm/Kconfig
+index b4ef6a2..f711b8a 100644
+--- a/arch/arm/Kconfig
++++ b/arch/arm/Kconfig
+@@ -385,6 +385,8 @@ source "arch/arm/mach-ep93xx/Kconfig"
+ 
+ source "arch/arm/mach-exynos/Kconfig"
+ 
++source "arch/arm/mach-fh8626/Kconfig"
++
+ source "arch/arm/mach-footbridge/Kconfig"
+ 
+ source "arch/arm/mach-gemini/Kconfig"
+diff --git a/arch/arm/Makefile b/arch/arm/Makefile
+index b7de4b6..d2c6269 100644
+--- a/arch/arm/Makefile
++++ b/arch/arm/Makefile
+@@ -185,6 +185,7 @@ machine-$(CONFIG_ARCH_DAVINCI)		+= davinci
+ machine-$(CONFIG_ARCH_DIGICOLOR)	+= digicolor
+ machine-$(CONFIG_ARCH_DOVE)		+= dove
+ machine-$(CONFIG_ARCH_EXYNOS)		+= exynos
++machine-$(CONFIG_ARCH_FH8626)		+= fh8626
+ machine-$(CONFIG_ARCH_FOOTBRIDGE)	+= footbridge
+ machine-$(CONFIG_ARCH_GEMINI)		+= gemini
+ machine-$(CONFIG_ARCH_HIGHBANK)		+= highbank
+diff --git a/arch/arm/boot/dts/Makefile b/arch/arm/boot/dts/Makefile
+index efe38eb..e57c27a 100644
+--- a/arch/arm/boot/dts/Makefile
++++ b/arch/arm/boot/dts/Makefile
+@@ -12,6 +12,7 @@ subdir-y += broadcom
+ subdir-y += calxeda
+ subdir-y += cirrus
+ subdir-y += cnxt
++subdir-y += fullhan
+ subdir-y += gemini
+ subdir-y += hisilicon
+ subdir-y += hpe
+diff --git a/arch/arm/boot/dts/fullhan/Makefile b/arch/arm/boot/dts/fullhan/Makefile
+new file mode 100644
+index 0000000..4ef1472
+--- /dev/null
++++ b/arch/arm/boot/dts/fullhan/Makefile
+@@ -0,0 +1 @@
++dtb-$(CONFIG_ARCH_FH8626) += fh8626v200.dtb
+diff --git a/arch/arm/boot/dts/fullhan/fh8626v200.dts b/arch/arm/boot/dts/fullhan/fh8626v200.dts
+new file mode 100644
+index 0000000..146499e
+--- /dev/null
++++ b/arch/arm/boot/dts/fullhan/fh8626v200.dts
+@@ -0,0 +1,395 @@
++/*
++ * Fullhan FH8626V200 -- minimal bring-up device tree (GPL-2.0).
++ *
++ * Fill in the two values below from the U-Boot CPU probe
++ * (CBAR and CNTFRQ) before building.
++ */
++/dts-v1/;
++#define FH8626_PERIPHBASE 0x30000000
++#define FH8626_CNTFRQ 24000000
++#include <dt-bindings/interrupt-controller/arm-gic.h>
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/input/input.h>
++#include <dt-bindings/clock/fullhan,fh8626-pmu.h>
++
++#ifndef FH8626_PERIPHBASE
++#error "Set FH8626_PERIPHBASE to the CBAR value read in U-Boot (see probe output)"
++#endif
++#ifndef FH8626_CNTFRQ
++#error "Set FH8626_CNTFRQ to the CNTFRQ value read in U-Boot (Hz)"
++#endif
++
++/ {
++	model = "Fullhan FH8626V200";
++	compatible = "fh,fh8626v200";
++	#address-cells = <1>;
++	#size-cells = <1>;
++	interrupt-parent = <&gic>;
++
++	aliases {
++		serial0 = &uart0;
++		i2c0 = &i2c0;
++	};
++
++	osc: clock-osc {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <24000000>;
++		clock-output-names = "osc_clk";
++	};
++
++	chosen {
++		/* earlycon: UART0 is at 0xf0700000 (reg-shift 2, 32-bit access) */
++		bootargs = "earlycon=uart8250,mmio32,0xf0700000 console=ttyS0,115200 loglevel=8";
++		stdout-path = "serial0:115200n8";
++	};
++
++	memory@a0000000 {
++		device_type = "memory";
++		reg = <0xa0000000 0x04000000>;	/* 64 MiB */
++	};
++
++	reserved-memory {
++		#address-cells = <1>;
++		#size-cells = <1>;
++		ranges;
++
++		/*
++		 * Camera buffers (fh8626-camera): four 1920x1088 NV12 frames,
++		 * one 4 MiB block each (the pool allocates powers of two).
++		 * Without a kernel mapping, so cam-probe can still use the
++		 * area through /dev/mem when the camera driver is idle.
++		 */
++		camera_mem: camera@a3000000 {
++			compatible = "shared-dma-pool";
++			reg = <0xa3000000 0x1000000>;
++			no-map;
++		};
++	};
++
++	cpus {
++		#address-cells = <1>;
++		#size-cells = <0>;
++		cpu@0 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a7";
++			reg = <0>;
++		};
++	};
++
++	timer {
++		compatible = "arm,armv7-timer";
++		interrupts = <GIC_PPI 13 (GIC_CPU_MASK_SIMPLE(1) | IRQ_TYPE_LEVEL_LOW)>,
++			     <GIC_PPI 14 (GIC_CPU_MASK_SIMPLE(1) | IRQ_TYPE_LEVEL_LOW)>,
++			     <GIC_PPI 11 (GIC_CPU_MASK_SIMPLE(1) | IRQ_TYPE_LEVEL_LOW)>,
++			     <GIC_PPI 10 (GIC_CPU_MASK_SIMPLE(1) | IRQ_TYPE_LEVEL_LOW)>;
++		clock-frequency = <FH8626_CNTFRQ>;
++	};
++
++	/* Cortex-A7 integrated GIC-400: offsets are fixed relative to PERIPHBASE */
++	gic: interrupt-controller@0 {
++		compatible = "arm,cortex-a7-gic";
++		#interrupt-cells = <3>;
++		interrupt-controller;
++		reg = <(FH8626_PERIPHBASE + 0x1000) 0x1000>,
++		      <(FH8626_PERIPHBASE + 0x2000) 0x2000>,
++		      <(FH8626_PERIPHBASE + 0x4000) 0x2000>,
++		      <(FH8626_PERIPHBASE + 0x6000) 0x2000>;
++	};
++
++	reg_usb_vbus: regulator-usb-vbus {
++		compatible = "regulator-fixed";
++		regulator-name = "usb-vbus";
++		regulator-min-microvolt = <5000000>;
++		regulator-max-microvolt = <5000000>;
++		gpio = <&porta1 15 GPIO_ACTIVE_HIGH>;	/* GPIO47 */
++		enable-active-high;
++	};
++
++	/* Pan: GPIO0..3 (stock "motorH"), 8100 half-steps at 900/s */
++	stepper-pan {
++		compatible = "gpio-stepper";
++		label = "pan";
++		pinctrl-names = "default";
++		pinctrl-0 = <&pan_pins>;
++		coil-gpios = <&porta0 0 GPIO_ACTIVE_HIGH>, <&porta0 1 GPIO_ACTIVE_HIGH>,
++			     <&porta0 2 GPIO_ACTIVE_HIGH>, <&porta0 3 GPIO_ACTIVE_HIGH>;
++		max-steps = <8100>;
++		steps-per-second = <900>;
++	};
++
++	/* Tilt: GPIO37, 38, 41, 42 (stock "motorV"), 1140 half-steps at 600/s */
++	stepper-tilt {
++		compatible = "gpio-stepper";
++		label = "tilt";
++		pinctrl-names = "default";
++		pinctrl-0 = <&tilt_pins>;
++		coil-gpios = <&porta1 5 GPIO_ACTIVE_HIGH>, <&porta1 6 GPIO_ACTIVE_HIGH>,
++			     <&porta1 9 GPIO_ACTIVE_HIGH>, <&porta1 10 GPIO_ACTIVE_HIGH>;
++		max-steps = <1140>;
++		steps-per-second = <600>;
++	};
++
++	/*
++	 * Latching IR-cut: a pulse on GPIO4 (stock "ircut_neg") puts the
++	 * filter in (day), one on GPIO43 ("ircut_pos") takes it out (night).
++	 * Checked on the board with the camera image.
++	 */
++	ircut {
++		compatible = "gpio-ircut";
++		pinctrl-names = "default";
++		pinctrl-0 = <&ircut_pins>;
++		day-gpios = <&porta0 4 GPIO_ACTIVE_HIGH>;
++		night-gpios = <&porta1 11 GPIO_ACTIVE_HIGH>;
++		pulse-ms = <150>;
++	};
++
++	leds {
++		compatible = "gpio-leds";
++		pinctrl-names = "default";
++		pinctrl-0 = <&led_pins>;
++
++		led-white {
++			label = "white";
++			gpios = <&porta1 7 GPIO_ACTIVE_HIGH>;
++			default-state = "off";
++		};
++
++		led-ir {
++			label = "ir";
++			gpios = <&porta1 8 GPIO_ACTIVE_HIGH>;
++			default-state = "off";
++		};
++	};
++
++	keys {
++		compatible = "gpio-keys";
++		pinctrl-names = "default";
++		pinctrl-0 = <&key_pins>;
++
++		key-reset {
++			label = "reset";
++			gpios = <&porta1 12 GPIO_ACTIVE_LOW>;
++			linux,code = <KEY_RESTART>;
++			debounce-interval = <20>;
++		};
++	};
++
++	soc {
++		compatible = "simple-bus";
++		#address-cells = <1>;
++		#size-cells = <1>;
++		ranges;
++
++		/* Also the clock provider, IDs in fullhan,fh8626-pmu.h */
++		pmu: syscon@f0000000 {
++			compatible = "fullhan,fh8626-pmu", "syscon";
++			reg = <0xf0000000 0x4000>;
++			clocks = <&osc>;
++			clock-names = "osc";
++			#clock-cells = <1>;
++		};
++
++		/*
++		 * Pad registers 0..47 at PMU + 0x80 + 4 * pad. Layout as written
++		 * by the stock fh_pinctrl: [27:24] function, 20 pull-up, 16
++		 * pull-down, [6:4] drive strength; bits 8, 12 and 28 are always
++		 * set (bit 12 not on MIPI pads). Entries are <offset value>.
++		 * After reset the sensor pads are in function 1 (GPIO).
++		 */
++		pinctrl: pinctrl@f0000080 {
++			compatible = "pinctrl-single";
++			reg = <0xf0000080 0xc0>;
++			#pinctrl-cells = <1>;
++			pinctrl-single,register-width = <32>;
++			pinctrl-single,function-mask = <0x1f111170>;
++
++			i2c0_pins: i2c0-pins {
++				pinctrl-single,pins = <
++					0x14 0x10101100	/* pad 5 I2C0_SCL, pull-up */
++					0x18 0x10101100	/* pad 6 I2C0_SDA, pull-up */
++				>;
++			};
++
++			sensor_pins: sensor-pins {
++				pinctrl-single,pins = <
++					0x1c 0x10001140	/* pad 7 SENSOR_CLK, drive 4 */
++					0x20 0x10001100	/* pad 8 GPIO13, sensor reset */
++				>;
++			};
++
++			/*
++			 * Actuator pads in function 1 (GPIO), no pulls. Pad map
++			 * from the stock fh_pinctrl table; the GPIO numbers are
++			 * those of the stock hardware.txt.
++			 */
++			pan_pins: pan-pins {
++				pinctrl-single,pins = <
++					0x50 0x01001000	/* pad 20 GPIO0 */
++					0x54 0x01001000	/* pad 21 GPIO1 */
++					0x58 0x01001000	/* pad 22 GPIO2 */
++					0x5c 0x01001000	/* pad 23 GPIO3 */
++				>;
++			};
++
++			tilt_pins: tilt-pins {
++				pinctrl-single,pins = <
++					0x34 0x01001000	/* pad 13 GPIO37 */
++					0x38 0x01001000	/* pad 14 GPIO38 */
++					0x3c 0x01001000	/* pad 15 GPIO41 */
++					0x40 0x01001000	/* pad 16 GPIO42 */
++				>;
++			};
++
++			ircut_pins: ircut-pins {
++				pinctrl-single,pins = <
++					0x48 0x01001000	/* pad 18 GPIO43, IR-cut + */
++					0x60 0x01001000	/* pad 24 GPIO4, IR-cut - */
++				>;
++			};
++
++			led_pins: led-pins {
++				pinctrl-single,pins = <
++					0x2c 0x01001000	/* pad 11 GPIO39, white LED */
++					0x30 0x01001000	/* pad 12 GPIO40, IR LED */
++				>;
++			};
++
++			key_pins: key-pins {
++				pinctrl-single,pins = <
++					0x4c 0x01001000	/* pad 19 GPIO44, reset key */
++				>;
++			};
++		};
++		gpio0: gpio@f0300000 {
++			compatible = "snps,dw-apb-gpio";
++			reg = <0xf0300000 0x1000>;
++			#address-cells = <1>;
++			#size-cells = <0>;
++
++			porta0: gpio-port@0 {
++				compatible = "snps,dw-apb-gpio-port";
++				reg = <0>;
++				gpio-controller;
++				#gpio-cells = <2>;
++				ngpios = <32>;
++			};
++		};
++		gpio1: gpio@f4000000 {
++			compatible = "snps,dw-apb-gpio";
++			reg = <0xf4000000 0x1000>;
++			#address-cells = <1>;
++			#size-cells = <0>;
++
++			porta1: gpio-port@0 {
++				compatible = "snps,dw-apb-gpio-port";
++				reg = <0>;
++				gpio-controller;
++				#gpio-cells = <2>;
++				ngpios = <32>;
++			};
++
++		};
++		/*
++		 * Camera: ISP (with the VPU registers inside), MIPI wrap,
++		 * CSI-2 host, D-PHY and the JPEG encoder. Interrupts: media
++		 * irq offset 32 + 7 (ISP, confirmed on the board through the
++		 * GIC pending bits) and + 13 (JPEG, from jpeg.ko).
++		 */
++		camera@e8400000 {
++			compatible = "fullhan,fh8626v200-camera";
++			reg = <0xe8400000 0x100000>, <0xf1000000 0x1000>,
++			      <0xf1100000 0x1000>, <0xf1700000 0x1000>,
++			      <0xe8300000 0x1000>;
++			reg-names = "isp", "wrap", "csi", "dphy", "jpeg";
++			interrupts = <GIC_SPI 7 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 13 IRQ_TYPE_LEVEL_HIGH>;
++			interrupt-names = "isp", "jpeg";
++			fullhan,pmu = <&pmu>;
++			memory-region = <&camera_mem>;
++
++			port {
++				camera_in: endpoint {
++					remote-endpoint = <&sensor_out>;
++					data-lanes = <1 2>;
++				};
++			};
++		};
++
++		/*
++		 * Bring-up helper for cam-probe (interrupt service only, the
++		 * configuration is done from user space). Same registers as
++		 * the camera node: enable one of the two.
++		 */
++		isp@e8400000 {
++			compatible = "fullhan,fh8626-isp-bringup";
++			reg = <0xe8400000 0x100000>;
++			interrupts = <GIC_SPI 7 IRQ_TYPE_LEVEL_HIGH>;
++			status = "disabled";
++		};
++
++		/* Sensor bus: SC2336 at 0x30 */
++		i2c0: i2c@f0200000 {
++			compatible = "snps,designware-i2c";
++			reg = <0xf0200000 0x1000>;
++			interrupts = <GIC_SPI 11 IRQ_TYPE_LEVEL_HIGH>;
++			pinctrl-names = "default";
++			pinctrl-0 = <&i2c0_pins>;
++			clocks = <&pmu FH8626_CLK_I2C0>;
++			clock-frequency = <100000>;
++			#address-cells = <1>;
++			#size-cells = <0>;
++			status = "okay";
++
++			sensor@30 {
++				compatible = "smartsens,sc2336";
++				reg = <0x30>;
++				pinctrl-names = "default";
++				pinctrl-0 = <&sensor_pins>;
++				/* MCLK: osc_clk / 1 */
++				clocks = <&pmu FH8626_CLK_CIS>;
++				assigned-clocks = <&pmu FH8626_CLK_CIS>;
++				assigned-clock-rates = <24000000>;
++				reset-gpios = <&porta0 13 GPIO_ACTIVE_LOW>;
++
++				port {
++					sensor_out: endpoint {
++						remote-endpoint = <&camera_in>;
++						data-lanes = <1 2>;
++						link-frequencies = /bits/ 64 <202500000>;
++					};
++				};
++			};
++		};
++
++		usb_phy: usb-phy {
++			compatible = "fullhan,fh8626-usb-phy";
++			fullhan,pmu = <&pmu>;
++			#phy-cells = <0>;
++			vbus-supply = <&reg_usb_vbus>;
++		};
++
++		usb@e0700000 {
++			compatible = "snps,dwc2";
++			reg = <0xe0700000 0x100000>;
++			interrupts = <0x00 0x27 0x04>;
++			phys = <&usb_phy>;
++			phy-names = "usb2-phy";
++			dr_mode = "host";
++		};
++		/*
++		 * No "interrupts" on purpose: the SoC interrupt routing into
++		 * the GIC is not verified yet, so the 8250 core falls back to
++		 * polling. earlycon does not need it.
++		 */
++		uart0: serial@f0700000 {
++			compatible = "snps,dw-apb-uart";
++			reg = <0xf0700000 0x100>;
++			reg-shift = <2>;
++			reg-io-width = <4>;
++			interrupts = <GIC_SPI 30 IRQ_TYPE_LEVEL_HIGH>;
++			clock-frequency = <16666667>;
++			status = "okay";
++		};
++	};
++};
+diff --git a/arch/arm/configs/fh8626_defconfig b/arch/arm/configs/fh8626_defconfig
+new file mode 100644
+index 0000000..445363e
+--- /dev/null
++++ b/arch/arm/configs/fh8626_defconfig
+@@ -0,0 +1,53 @@
++CONFIG_KERNEL_XZ=y
++CONFIG_NO_HZ_IDLE=y
++CONFIG_HIGH_RES_TIMERS=y
++CONFIG_BLK_DEV_INITRD=y
++CONFIG_INITRAMFS_SOURCE="/home/heip/open-cam-fw-lts/build/rootfs/initramfs.list"
++CONFIG_EXPERT=y
++CONFIG_ARCH_FH8626=y
++# CONFIG_ATAGS is not set
++CONFIG_ARM_APPENDED_DTB=y
++CONFIG_MODULES=y
++CONFIG_NET=y
++CONFIG_PACKET=y
++CONFIG_UNIX=y
++CONFIG_INET=y
++CONFIG_CFG80211=y
++CONFIG_RFKILL=y
++CONFIG_DEVTMPFS=y
++CONFIG_DEVTMPFS_MOUNT=y
++CONFIG_SERIAL_8250=y
++CONFIG_SERIAL_8250_CONSOLE=y
++CONFIG_SERIAL_8250_NR_UARTS=1
++CONFIG_SERIAL_8250_RUNTIME_UARTS=1
++CONFIG_SERIAL_8250_DW=y
++CONFIG_SERIAL_OF_PLATFORM=y
++CONFIG_PINCTRL=y
++CONFIG_PINCTRL_SINGLE=y
++CONFIG_GPIOLIB=y
++CONFIG_GPIO_DWAPB=y
++CONFIG_REGULATOR=y
++CONFIG_REGULATOR_FIXED_VOLTAGE=y
++CONFIG_MEDIA_SUPPORT=y
++CONFIG_MEDIA_SUPPORT_FILTER=y
++CONFIG_MEDIA_CAMERA_SUPPORT=y
++CONFIG_MEDIA_PLATFORM_SUPPORT=y
++CONFIG_VIDEO_SC2336=y
++CONFIG_VIDEO_FH8626_ISP_BRINGUP=y
++CONFIG_VIDEO_FH8626_CAMERA=y
++CONFIG_USB=y
++CONFIG_USB_ANNOUNCE_NEW_DEVICES=y
++CONFIG_USB_DWC2=y
++CONFIG_PHY_FH8626_USB=y
++CONFIG_TMPFS=y
++CONFIG_I2C=y
++CONFIG_I2C_CHARDEV=y
++CONFIG_I2C_DESIGNWARE_CORE=y
++CONFIG_I2C_DESIGNWARE_PLATFORM=y
++CONFIG_INPUT_EVDEV=y
++CONFIG_KEYBOARD_GPIO=y
++CONFIG_NEW_LEDS=y
++CONFIG_LEDS_CLASS=y
++CONFIG_LEDS_GPIO=y
++CONFIG_GPIO_STEPPER=y
++CONFIG_GPIO_IRCUT=y
+diff --git a/arch/arm/mach-fh8626/Kconfig b/arch/arm/mach-fh8626/Kconfig
+new file mode 100644
+index 0000000..860fdfa
+--- /dev/null
++++ b/arch/arm/mach-fh8626/Kconfig
+@@ -0,0 +1,11 @@
++config ARCH_FH8626
++	bool "Fullhan FH8626V200 (Cortex-A7)"
++	depends on ARCH_MULTI_V7
++	select ARM_GIC
++	select ARM_ARCH_TIMER
++	select HAVE_ARM_ARCH_TIMER
++	select GENERIC_IRQ_CHIP
++	help
++	  Support for the Fullhan FH8626V200 SoC (single Cortex-A7,
++	  64 MiB in-package DRAM). Device-tree only. This is an
++	  independent port; it does not use arch/arm/mach-fh.
+diff --git a/arch/arm/mach-fh8626/Makefile b/arch/arm/mach-fh8626/Makefile
+new file mode 100644
+index 0000000..0a15a5b
+--- /dev/null
++++ b/arch/arm/mach-fh8626/Makefile
+@@ -0,0 +1 @@
++obj-y += fh8626.o
+diff --git a/arch/arm/mach-fh8626/fh8626.c b/arch/arm/mach-fh8626/fh8626.c
+new file mode 100644
+index 0000000..bf57a88
+--- /dev/null
++++ b/arch/arm/mach-fh8626/fh8626.c
+@@ -0,0 +1,57 @@
++/*
++ * Fullhan FH8626V200 machine support (device tree only).
++ *
++ * GPL-2.0. Independent of arch/arm/mach-fh: the OpenIPC FH885x code
++ * targets ARM1176 parts and is not used here.
++ *
++ * PMU chip-ID offsets (0x00 plat id, 0x04 ip version) come from the
++ * FH885x sources (REG_PMU_CHIP_ID / REG_PMU_IP_VER); for V200 the
++ * value 0x20102801 was observed on hardware, not taken from a source.
++ */
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/of_platform.h>
++#include <asm/mach/arch.h>
++
++#define FH8626_PMU_CHIP_ID	0x00
++#define FH8626_PMU_IP_VER	0x04
++#define FH8626V200_PLAT_ID	0x20102801
++
++static void __init fh8626_report_chip(void)
++{
++	struct device_node *np;
++	void __iomem *base;
++
++	np = of_find_compatible_node(NULL, NULL, "fh,fh8626-pmu");
++	if (!np)
++		return;
++	base = of_iomap(np, 0);
++	if (base) {
++		u32 id = readl(base + FH8626_PMU_CHIP_ID);
++
++		pr_info("FH8626: PMU chip id %08x ip ver %08x%s\n", id,
++			readl(base + FH8626_PMU_IP_VER),
++			id == FH8626V200_PLAT_ID ? "" : " (UNEXPECTED)");
++		iounmap(base);
++	}
++	of_node_put(np);
++}
++
++static void __init fh8626_init_machine(void)
++{
++	fh8626_report_chip();
++	of_platform_default_populate(NULL, NULL, NULL);
++}
++
++static const char *const fh8626_dt_compat[] __initconst = {
++	"fh,fh8626v200",
++	NULL
++};
++
++DT_MACHINE_START(FH8626, "Fullhan FH8626V200 (Device Tree)")
++	.dt_compat	= fh8626_dt_compat,
++	.init_machine	= fh8626_init_machine,
++MACHINE_END
+diff --git a/drivers/clk/Kconfig b/drivers/clk/Kconfig
+index 3a16110..3cdcc31 100644
+--- a/drivers/clk/Kconfig
++++ b/drivers/clk/Kconfig
+@@ -478,6 +478,15 @@ config COMMON_CLK_BD718XX
+ 	  This driver supports ROHM BD71837, BD71847, BD71850, BD71815
+ 	  and BD71828 PMICs clock gates.
+ 
++config COMMON_CLK_FH8626
++	bool "Clock driver for the Fullhan FH8626V200 PMU"
++	depends on ARCH_FH8626 || COMPILE_TEST
++	depends on OF && HAS_IOMEM
++	default ARCH_FH8626
++	help
++	  Support for the PLL and peripheral clocks of the Fullhan
++	  FH8626V200 SoC, as far as they are needed by its drivers.
++
+ config COMMON_CLK_FIXED_MMIO
+ 	bool "Clock driver for Memory Mapped Fixed values"
+ 	depends on COMMON_CLK && OF
+diff --git a/drivers/clk/Makefile b/drivers/clk/Makefile
+index 61ec084..6dddfdc 100644
+--- a/drivers/clk/Makefile
++++ b/drivers/clk/Makefile
+@@ -58,6 +58,7 @@ obj-$(CONFIG_COMMON_CLK_EP93XX)		+= clk-ep93xx.o
+ obj-$(CONFIG_ARCH_SPARX5)		+= clk-sparx5.o
+ obj-$(CONFIG_COMMON_CLK_EN7523)		+= clk-en7523.o
+ obj-$(CONFIG_COMMON_CLK_EYEQ)		+= clk-eyeq.o
++obj-$(CONFIG_COMMON_CLK_FH8626)		+= clk-fh8626.o
+ obj-$(CONFIG_COMMON_CLK_FIXED_MMIO)	+= clk-fixed-mmio.o
+ obj-$(CONFIG_COMMON_CLK_FSL_FLEXSPI)	+= clk-fsl-flexspi.o
+ obj-$(CONFIG_COMMON_CLK_FSL_SAI)	+= clk-fsl-sai.o
+diff --git a/drivers/clk/clk-fh8626.c b/drivers/clk/clk-fh8626.c
+new file mode 100644
+index 0000000..62ec5e3
+--- /dev/null
++++ b/drivers/clk/clk-fh8626.c
+@@ -0,0 +1,300 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Fullhan FH8626V200 PMU clocks
++ *
++ * The PMU at 0xf0000000 holds the PLL configuration and, per peripheral
++ * clock, a parent select bit, a divider field and a gate bit.  Only the
++ * clocks needed so far are described here; more can be added to the
++ * table as drivers need them.
++ *
++ * Register layout and formulas come from a static analysis of the stock
++ * firmware (kernel 4.9.129, fh_clks table and its clk ops):
++ *
++ *  - divider: rate = parent / (field + 1)
++ *  - mux:     field value = parent index
++ *  - gate:    bit set = clock off (confirmed on the board: setting the
++ *             i2c0 gate makes the controller registers read as 0)
++ *  - PLL:     rate = osc * M / (N + 1) / (P + 1) / POST
++ *
++ * The PLL rates computed this way give 16.667 MHz for uart0_clk, the
++ * rate the console has been running on.  No vendor code is used.
++ *
++ * The PLL and cpu_div15 are read-only: they are set up by the boot loader
++ * and feed the CPU, the bus and the UART.  The UART divider is read-only
++ * and its gate critical for the same reason.
++ *
++ * The register block is shared with the syscon users of the PMU node
++ * (USB PHY) and with pinctrl-single (pad registers at 0x80), so it is
++ * mapped without claiming the region.
++ */
++#include <dt-bindings/clock/fullhan,fh8626-pmu.h>
++#include <linux/bits.h>
++#include <linux/clk-provider.h>
++#include <linux/io.h>
++#include <linux/math64.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/spinlock.h>
++
++#define PMU_PLL_CPU_CFG		0x14
++#define PMU_SEL			0x0c
++#define PMU_GATE0		0x1c
++#define PMU_DIV_28		0x28
++#define PMU_DIV_34		0x34
++#define PMU_DIV_38		0x38
++#define PMU_PLL_CPU_POST	0x64
++
++#define FH8626_NR_CLKS		(FH8626_CLK_CIS + 1)
++#define FH8626_OSC		(-1)	/* parent: the "osc" input clock */
++
++struct fh8626_pll {
++	struct clk_hw hw;
++	void __iomem *cfg;
++	void __iomem *post;
++	u8 p_shift;	/* P field in cfg: 16 for pclk, 24 for rclk */
++	u8 post_shift;	/* POST field in post: 8 for pclk, 12 for rclk */
++};
++
++#define to_fh8626_pll(_hw) container_of(_hw, struct fh8626_pll, hw)
++
++static unsigned int fh8626_pll_post_div(u32 field)
++{
++	switch (field) {
++	case 0:
++		return 1;
++	case 8:
++		return 2;
++	case 12:
++		return 4;
++	case 13:
++		return 8;
++	case 14:
++		return 16;
++	case 15:
++		return 32;
++	default:
++		return 0;
++	}
++}
++
++static unsigned long fh8626_pll_recalc_rate(struct clk_hw *hw,
++					    unsigned long parent_rate)
++{
++	struct fh8626_pll *pll = to_fh8626_pll(hw);
++	u32 cfg = readl(pll->cfg);
++	u32 m = cfg & 0x7f;
++	u32 n = (cfg >> 8) & 0x1f;
++	u32 p = (cfg >> pll->p_shift) & 0x3f;
++	unsigned int post;
++	u64 rate;
++
++	/* Special M encodings, as handled by the stock code */
++	if (m <= 3)
++		m += 128;
++	else if (m == 11)
++		m = 10;
++
++	post = fh8626_pll_post_div((readl(pll->post) >> pll->post_shift) & 0xf);
++	if (!post) {
++		pr_warn("%s: unknown post divider\n", clk_hw_get_name(hw));
++		post = 1;
++	}
++
++	rate = (u64)parent_rate * m;
++	rate = div_u64(rate, n + 1);
++	rate = div_u64(rate, p + 1);
++	return div_u64(rate, post);
++}
++
++static const struct clk_ops fh8626_pll_ops = {
++	.recalc_rate = fh8626_pll_recalc_rate,
++};
++
++/* Peripheral clock: optional mux, divider, optional gate */
++struct fh8626_periph {
++	int id;
++	const char *name;
++	int parents[2];
++	u8 num_parents;
++	u16 mux_reg;
++	u8 mux_shift;
++	u16 div_reg;
++	u8 div_shift;
++	u8 div_width;
++	u8 div_flags;
++	u16 gate_reg;		/* 0: no gate */
++	u8 gate_bit;
++	unsigned long flags;
++};
++
++static const struct fh8626_periph fh8626_periphs[] = {
++	{
++		.id = FH8626_CLK_CPU_DIV15, .name = "cpu_div15_clk",
++		.parents = { FH8626_CLK_PLL_CPU_P }, .num_parents = 1,
++		.div_reg = PMU_DIV_38, .div_shift = 24, .div_width = 8,
++		.div_flags = CLK_DIVIDER_READ_ONLY,
++	}, {
++		.id = FH8626_CLK_UART0, .name = "uart0_clk",
++		.parents = { FH8626_CLK_CPU_DIV15 }, .num_parents = 1,
++		.div_reg = PMU_DIV_34, .div_shift = 0, .div_width = 6,
++		.div_flags = CLK_DIVIDER_READ_ONLY,
++		.gate_reg = PMU_GATE0, .gate_bit = 13,
++		.flags = CLK_IS_CRITICAL,
++	}, {
++		.id = FH8626_CLK_I2C0, .name = "i2c0_clk",
++		.parents = { FH8626_CLK_CPU_DIV15 }, .num_parents = 1,
++		.div_reg = PMU_DIV_34, .div_shift = 16, .div_width = 6,
++		.gate_reg = PMU_GATE0, .gate_bit = 12,
++	}, {
++		.id = FH8626_CLK_CIS, .name = "cis_clk_out",
++		.parents = { FH8626_OSC, FH8626_CLK_PLL_CPU_P }, .num_parents = 2,
++		.mux_reg = PMU_SEL, .mux_shift = 4,
++		.div_reg = PMU_DIV_28, .div_shift = 16, .div_width = 8,
++		.gate_reg = PMU_GATE0, .gate_bit = 23,
++	},
++};
++
++struct fh8626_clk {
++	void __iomem *base;
++	spinlock_t lock;	/* shared registers: gates, dividers */
++	struct clk_hw_onecell_data *data;
++};
++
++static struct clk_hw *fh8626_register_periph(struct device *dev,
++					     struct fh8626_clk *c,
++					     const struct fh8626_periph *p)
++{
++	struct clk_parent_data pdata[2] = {};
++	struct clk_hw *mux_hw = NULL, *gate_hw = NULL;
++	struct clk_divider *div;
++	int i;
++
++	for (i = 0; i < p->num_parents; i++) {
++		if (p->parents[i] == FH8626_OSC)
++			pdata[i].fw_name = "osc";
++		else
++			pdata[i].hw = c->data->hws[p->parents[i]];
++	}
++
++	if (p->num_parents > 1) {
++		struct clk_mux *mux = devm_kzalloc(dev, sizeof(*mux), GFP_KERNEL);
++
++		if (!mux)
++			return ERR_PTR(-ENOMEM);
++		mux->reg = c->base + p->mux_reg;
++		mux->shift = p->mux_shift;
++		mux->mask = BIT(fls(p->num_parents - 1)) - 1;
++		mux->lock = &c->lock;
++		mux_hw = &mux->hw;
++	}
++
++	div = devm_kzalloc(dev, sizeof(*div), GFP_KERNEL);
++	if (!div)
++		return ERR_PTR(-ENOMEM);
++	div->reg = c->base + p->div_reg;
++	div->shift = p->div_shift;
++	div->width = p->div_width;
++	div->flags = p->div_flags;
++	div->lock = &c->lock;
++
++	if (p->gate_reg) {
++		struct clk_gate *gate = devm_kzalloc(dev, sizeof(*gate), GFP_KERNEL);
++
++		if (!gate)
++			return ERR_PTR(-ENOMEM);
++		gate->reg = c->base + p->gate_reg;
++		gate->bit_idx = p->gate_bit;
++		gate->flags = CLK_GATE_SET_TO_DISABLE;
++		gate->lock = &c->lock;
++		gate_hw = &gate->hw;
++	}
++
++	return devm_clk_hw_register_composite_pdata(dev, p->name, pdata,
++			p->num_parents,
++			mux_hw, mux_hw ? &clk_mux_ops : NULL,
++			&div->hw, (p->div_flags & CLK_DIVIDER_READ_ONLY) ?
++				  &clk_divider_ro_ops : &clk_divider_ops,
++			gate_hw, gate_hw ? &clk_gate_ops : NULL,
++			p->flags);
++}
++
++static int fh8626_clk_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct clk_parent_data osc = { .fw_name = "osc" };
++	struct clk_init_data init = {};
++	struct fh8626_pll *pll;
++	struct resource *res;
++	struct fh8626_clk *c;
++	struct clk_hw *hw;
++	int i, ret;
++
++	c = devm_kzalloc(dev, sizeof(*c), GFP_KERNEL);
++	if (!c)
++		return -ENOMEM;
++	c->data = devm_kzalloc(dev, struct_size(c->data, hws, FH8626_NR_CLKS),
++			       GFP_KERNEL);
++	if (!c->data)
++		return -ENOMEM;
++	c->data->num = FH8626_NR_CLKS;
++	for (i = 0; i < FH8626_NR_CLKS; i++)
++		c->data->hws[i] = ERR_PTR(-ENOENT);
++	spin_lock_init(&c->lock);
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res)
++		return -EINVAL;
++	/* Not devm_ioremap_resource(): the region is shared, see above */
++	c->base = devm_ioremap(dev, res->start, resource_size(res));
++	if (!c->base)
++		return -ENOMEM;
++
++	pll = devm_kzalloc(dev, sizeof(*pll), GFP_KERNEL);
++	if (!pll)
++		return -ENOMEM;
++	pll->cfg = c->base + PMU_PLL_CPU_CFG;
++	pll->post = c->base + PMU_PLL_CPU_POST;
++	pll->p_shift = 16;
++	pll->post_shift = 8;
++	init.name = "pll_cpu_pclk";
++	init.ops = &fh8626_pll_ops;
++	init.parent_data = &osc;
++	init.num_parents = 1;
++	pll->hw.init = &init;
++	ret = devm_clk_hw_register(dev, &pll->hw);
++	if (ret)
++		return dev_err_probe(dev, ret, "cannot register %s\n", init.name);
++	c->data->hws[FH8626_CLK_PLL_CPU_P] = &pll->hw;
++
++	for (i = 0; i < ARRAY_SIZE(fh8626_periphs); i++) {
++		const struct fh8626_periph *p = &fh8626_periphs[i];
++
++		hw = fh8626_register_periph(dev, c, p);
++		if (IS_ERR(hw))
++			return dev_err_probe(dev, PTR_ERR(hw),
++					     "cannot register %s\n", p->name);
++		c->data->hws[p->id] = hw;
++	}
++
++	return devm_of_clk_add_hw_provider(dev, of_clk_hw_onecell_get, c->data);
++}
++
++static const struct of_device_id fh8626_clk_of_match[] = {
++	{ .compatible = "fullhan,fh8626-pmu" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, fh8626_clk_of_match);
++
++static struct platform_driver fh8626_clk_driver = {
++	.probe = fh8626_clk_probe,
++	.driver = {
++		.name = "fh8626-clk",
++		.of_match_table = fh8626_clk_of_match,
++		.suppress_bind_attrs = true,
++	},
++};
++builtin_platform_driver(fh8626_clk_driver);
++
++MODULE_DESCRIPTION("Fullhan FH8626V200 PMU clock driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/media/i2c/Kconfig b/drivers/media/i2c/Kconfig
+index cdd7ba5..04221b7 100644
+--- a/drivers/media/i2c/Kconfig
++++ b/drivers/media/i2c/Kconfig
+@@ -745,6 +745,18 @@ config VIDEO_S5K6A3
+ 	  This is a V4L2 sensor driver for Samsung S5K6A3 raw
+ 	  camera sensor.
+ 
++config VIDEO_SC2336
++	tristate "SmartSens SC2336 sensor support"
++	select V4L2_CCI_I2C
++	depends on GPIOLIB
++	help
++	  This is a Video4Linux2 sensor driver for the SmartSens
++	  SC2336 camera sensor. It powers the sensor up and checks
++	  its chip ID; streaming is not supported yet.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called sc2336.
++
+ config VIDEO_VD55G1
+ 	tristate "ST VD55G1 sensor support"
+ 	select V4L2_CCI_I2C
+diff --git a/drivers/media/i2c/Makefile b/drivers/media/i2c/Makefile
+index 57cdd8d..3cef059 100644
+--- a/drivers/media/i2c/Makefile
++++ b/drivers/media/i2c/Makefile
+@@ -126,6 +126,7 @@ obj-$(CONFIG_VIDEO_RJ54N1) += rj54n1cb0c.o
+ obj-$(CONFIG_VIDEO_S5C73M3) += s5c73m3/
+ obj-$(CONFIG_VIDEO_S5K5BAF) += s5k5baf.o
+ obj-$(CONFIG_VIDEO_S5K6A3) += s5k6a3.o
++obj-$(CONFIG_VIDEO_SC2336) += sc2336.o
+ obj-$(CONFIG_VIDEO_SAA6588) += saa6588.o
+ obj-$(CONFIG_VIDEO_SAA6752HS) += saa6752hs.o
+ obj-$(CONFIG_VIDEO_SAA7110) += saa7110.o
+diff --git a/drivers/media/i2c/sc2336.c b/drivers/media/i2c/sc2336.c
+new file mode 100644
+index 0000000..37ab8a9
+--- /dev/null
++++ b/drivers/media/i2c/sc2336.c
+@@ -0,0 +1,780 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * SmartSens SC2336 image sensor driver
++ *
++ * One mode: 1920x1080 RAW10 at 30 fps over 2 MIPI CSI-2 lanes (405 Mbit/s
++ * per lane), from a 24 MHz MCLK.
++ *
++ * The mode register table and the exposure, gain, flip and test pattern
++ * register handling come from the Rockchip sc2336 driver (GPL-2.0,
++ * Copyright (C) 2022 Rockchip Electronics Co., Ltd.). Chip ID, I2C address
++ * (0x30), MCLK and power-up order were verified on a Fullhan FH8626V200
++ * camera board.
++ */
++
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/pm_runtime.h>
++#include <linux/regulator/consumer.h>
++#include <linux/units.h>
++#include <media/v4l2-cci.h>
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-device.h>
++#include <media/v4l2-fwnode.h>
++#include <media/v4l2-subdev.h>
++
++#define SC2336_MCLK_FREQ_24MHZ		(24 * HZ_PER_MHZ)
++#define SC2336_LINK_FREQ		202500000
++#define SC2336_LANES			2
++#define SC2336_BITS_PER_SAMPLE		10
++/* 81 MHz */
++#define SC2336_PIXEL_RATE		(SC2336_LINK_FREQ * 2 * SC2336_LANES / \
++					 SC2336_BITS_PER_SAMPLE)
++
++#define SC2336_REG_MODE_SELECT		CCI_REG8(0x0100)
++#define SC2336_MODE_STANDBY		0x00
++#define SC2336_MODE_STREAMING		BIT(0)
++
++#define SC2336_REG_CHIP_ID		CCI_REG16(0x3107)
++#define SC2336_CHIP_ID			0xcb3a
++
++#define SC2336_REG_VTS			CCI_REG16(0x320e)
++#define SC2336_HTS			2250
++#define SC2336_VTS_DEFAULT		1200
++#define SC2336_VTS_MAX			0x7fff
++
++#define SC2336_REG_FLIP_MIRROR		CCI_REG8(0x3221)
++#define SC2336_MIRROR			(BIT(1) | BIT(2))
++#define SC2336_FLIP			(BIT(5) | BIT(6))
++
++/* Exposure in lines, register holds lines << 4 (4 fractional bits) */
++#define SC2336_REG_EXPOSURE		CCI_REG24(0x3e00)
++#define SC2336_EXPOSURE_MIN		1
++#define SC2336_EXPOSURE_MARGIN		6
++#define SC2336_EXPOSURE_DEFAULT		0x80
++
++#define SC2336_REG_DIG_GAIN		CCI_REG8(0x3e06)
++#define SC2336_REG_DIG_FINE_GAIN	CCI_REG8(0x3e07)
++#define SC2336_REG_ANA_GAIN		CCI_REG8(0x3e09)
++/* Total (analogue + digital) gain, 32 = 1x */
++#define SC2336_GAIN_MIN			0x20
++#define SC2336_GAIN_MAX			4096
++#define SC2336_GAIN_DEFAULT		0x80
++
++#define SC2336_REG_TEST_PATTERN		CCI_REG8(0x4501)
++#define SC2336_TEST_PATTERN_ENABLE	BIT(3)
++
++#define SC2336_NATIVE_WIDTH		1920
++#define SC2336_NATIVE_HEIGHT		1080
++#define SC2336_MBUS_CODE		MEDIA_BUS_FMT_SBGGR10_1X10
++
++static const char * const sc2336_supply_names[] = {
++	"avdd",		/* analog */
++	"dovdd",	/* I/O */
++	"dvdd",		/* core */
++};
++
++#define SC2336_NUM_SUPPLIES		ARRAY_SIZE(sc2336_supply_names)
++
++static const s64 sc2336_link_freq_menu[] = {
++	SC2336_LINK_FREQ,
++};
++
++static const char * const sc2336_test_pattern_menu[] = {
++	"Disabled",
++	"Color Bars",
++};
++
++/* 1920x1080 RAW10, 30 fps, HTS 2250 (0x8ca), VTS 1200 (0x4b0) */
++static const struct cci_reg_sequence sc2336_1080p_30fps_regs[] = {
++	{ CCI_REG8(0x0103), 0x01 },
++	{ CCI_REG8(0x0100), 0x00 },
++	{ CCI_REG8(0x36e9), 0x80 },
++	{ CCI_REG8(0x37f9), 0x80 },
++	{ CCI_REG8(0x301f), 0x02 },
++	{ CCI_REG8(0x3106), 0x05 },
++	{ CCI_REG8(0x320c), 0x08 },
++	{ CCI_REG8(0x320d), 0xca },
++	{ CCI_REG8(0x320e), 0x04 },
++	{ CCI_REG8(0x320f), 0xb0 },
++	{ CCI_REG8(0x3248), 0x04 },
++	{ CCI_REG8(0x3249), 0x0b },
++	{ CCI_REG8(0x3253), 0x08 },
++	{ CCI_REG8(0x3301), 0x09 },
++	{ CCI_REG8(0x3302), 0xff },
++	{ CCI_REG8(0x3303), 0x10 },
++	{ CCI_REG8(0x3306), 0x68 },
++	{ CCI_REG8(0x3307), 0x02 },
++	{ CCI_REG8(0x330a), 0x01 },
++	{ CCI_REG8(0x330b), 0x18 },
++	{ CCI_REG8(0x330c), 0x16 },
++	{ CCI_REG8(0x330d), 0xff },
++	{ CCI_REG8(0x3318), 0x02 },
++	{ CCI_REG8(0x3321), 0x0a },
++	{ CCI_REG8(0x3327), 0x0e },
++	{ CCI_REG8(0x332b), 0x12 },
++	{ CCI_REG8(0x3333), 0x10 },
++	{ CCI_REG8(0x3334), 0x40 },
++	{ CCI_REG8(0x335e), 0x06 },
++	{ CCI_REG8(0x335f), 0x0a },
++	{ CCI_REG8(0x3364), 0x1f },
++	{ CCI_REG8(0x337c), 0x02 },
++	{ CCI_REG8(0x337d), 0x0e },
++	{ CCI_REG8(0x3390), 0x09 },
++	{ CCI_REG8(0x3391), 0x0f },
++	{ CCI_REG8(0x3392), 0x1f },
++	{ CCI_REG8(0x3393), 0x20 },
++	{ CCI_REG8(0x3394), 0x20 },
++	{ CCI_REG8(0x3395), 0xff },
++	{ CCI_REG8(0x33a2), 0x04 },
++	{ CCI_REG8(0x33b1), 0x80 },
++	{ CCI_REG8(0x33b2), 0x68 },
++	{ CCI_REG8(0x33b3), 0x42 },
++	{ CCI_REG8(0x33f9), 0x78 },
++	{ CCI_REG8(0x33fb), 0xe0 },
++	{ CCI_REG8(0x33fc), 0x0f },
++	{ CCI_REG8(0x33fd), 0x1f },
++	{ CCI_REG8(0x349f), 0x03 },
++	{ CCI_REG8(0x34a6), 0x0f },
++	{ CCI_REG8(0x34a7), 0x1f },
++	{ CCI_REG8(0x34a8), 0x42 },
++	{ CCI_REG8(0x34a9), 0x06 },
++	{ CCI_REG8(0x34aa), 0x01 },
++	{ CCI_REG8(0x34ab), 0x28 },
++	{ CCI_REG8(0x34ac), 0x01 },
++	{ CCI_REG8(0x34ad), 0x90 },
++	{ CCI_REG8(0x3630), 0xf4 },
++	{ CCI_REG8(0x3633), 0x22 },
++	{ CCI_REG8(0x3639), 0xf4 },
++	{ CCI_REG8(0x363c), 0x47 },
++	{ CCI_REG8(0x3670), 0x09 },
++	{ CCI_REG8(0x3674), 0xf4 },
++	{ CCI_REG8(0x3675), 0xfb },
++	{ CCI_REG8(0x3676), 0xed },
++	{ CCI_REG8(0x367c), 0x09 },
++	{ CCI_REG8(0x367d), 0x0f },
++	{ CCI_REG8(0x3690), 0x22 },
++	{ CCI_REG8(0x3691), 0x22 },
++	{ CCI_REG8(0x3692), 0x22 },
++	{ CCI_REG8(0x3698), 0x89 },
++	{ CCI_REG8(0x3699), 0x96 },
++	{ CCI_REG8(0x369a), 0xd0 },
++	{ CCI_REG8(0x369b), 0xd0 },
++	{ CCI_REG8(0x369c), 0x09 },
++	{ CCI_REG8(0x369d), 0x0f },
++	{ CCI_REG8(0x36a2), 0x09 },
++	{ CCI_REG8(0x36a3), 0x0f },
++	{ CCI_REG8(0x36a4), 0x1f },
++	{ CCI_REG8(0x36d0), 0x01 },
++	{ CCI_REG8(0x36ea), 0x09 },
++	{ CCI_REG8(0x36eb), 0x0c },
++	{ CCI_REG8(0x36ec), 0x1c },
++	{ CCI_REG8(0x36ed), 0x28 },
++	{ CCI_REG8(0x3722), 0xe1 },
++	{ CCI_REG8(0x3724), 0x41 },
++	{ CCI_REG8(0x3725), 0xc1 },
++	{ CCI_REG8(0x3728), 0x20 },
++	{ CCI_REG8(0x37fa), 0x09 },
++	{ CCI_REG8(0x37fb), 0x32 },
++	{ CCI_REG8(0x37fc), 0x11 },
++	{ CCI_REG8(0x37fd), 0x37 },
++	{ CCI_REG8(0x3900), 0x0d },
++	{ CCI_REG8(0x3905), 0x98 },
++	{ CCI_REG8(0x391b), 0x81 },
++	{ CCI_REG8(0x391c), 0x10 },
++	{ CCI_REG8(0x3933), 0x81 },
++	{ CCI_REG8(0x3934), 0xc5 },
++	{ CCI_REG8(0x3940), 0x68 },
++	{ CCI_REG8(0x3941), 0x00 },
++	{ CCI_REG8(0x3942), 0x01 },
++	{ CCI_REG8(0x3943), 0xc6 },
++	{ CCI_REG8(0x3952), 0x02 },
++	{ CCI_REG8(0x3953), 0x0f },
++	{ CCI_REG8(0x3e01), 0x4a },
++	{ CCI_REG8(0x3e02), 0xa0 },
++	{ CCI_REG8(0x3e08), 0x1f },
++	{ CCI_REG8(0x3e1b), 0x14 },
++	{ CCI_REG8(0x440e), 0x02 },
++	{ CCI_REG8(0x4509), 0x38 },
++	{ CCI_REG8(0x4819), 0x06 },
++	{ CCI_REG8(0x481b), 0x03 },
++	{ CCI_REG8(0x481d), 0x0b },
++	{ CCI_REG8(0x481f), 0x03 },
++	{ CCI_REG8(0x4821), 0x08 },
++	{ CCI_REG8(0x4823), 0x03 },
++	{ CCI_REG8(0x4825), 0x03 },
++	{ CCI_REG8(0x4827), 0x03 },
++	{ CCI_REG8(0x4829), 0x05 },
++	{ CCI_REG8(0x5799), 0x06 },
++	{ CCI_REG8(0x5ae0), 0xfe },
++	{ CCI_REG8(0x5ae1), 0x40 },
++	{ CCI_REG8(0x5ae2), 0x30 },
++	{ CCI_REG8(0x5ae3), 0x28 },
++	{ CCI_REG8(0x5ae4), 0x20 },
++	{ CCI_REG8(0x5ae5), 0x30 },
++	{ CCI_REG8(0x5ae6), 0x28 },
++	{ CCI_REG8(0x5ae7), 0x20 },
++	{ CCI_REG8(0x5ae8), 0x3c },
++	{ CCI_REG8(0x5ae9), 0x30 },
++	{ CCI_REG8(0x5aea), 0x28 },
++	{ CCI_REG8(0x5aeb), 0x3c },
++	{ CCI_REG8(0x5aec), 0x30 },
++	{ CCI_REG8(0x5aed), 0x28 },
++	{ CCI_REG8(0x5aee), 0xfe },
++	{ CCI_REG8(0x5aef), 0x40 },
++	{ CCI_REG8(0x5af4), 0x30 },
++	{ CCI_REG8(0x5af5), 0x28 },
++	{ CCI_REG8(0x5af6), 0x20 },
++	{ CCI_REG8(0x5af7), 0x30 },
++	{ CCI_REG8(0x5af8), 0x28 },
++	{ CCI_REG8(0x5af9), 0x20 },
++	{ CCI_REG8(0x5afa), 0x3c },
++	{ CCI_REG8(0x5afb), 0x30 },
++	{ CCI_REG8(0x5afc), 0x28 },
++	{ CCI_REG8(0x5afd), 0x3c },
++	{ CCI_REG8(0x5afe), 0x30 },
++	{ CCI_REG8(0x5aff), 0x28 },
++	{ CCI_REG8(0x36e9), 0x53 },
++	{ CCI_REG8(0x37f9), 0x53 },
++};
++
++struct sc2336 {
++	struct device *dev;
++	struct regmap *regmap;
++	struct clk *mclk;
++	struct gpio_desc *reset_gpio;
++	struct regulator_bulk_data supplies[SC2336_NUM_SUPPLIES];
++
++	struct v4l2_subdev sd;
++	struct media_pad pad;
++
++	struct v4l2_ctrl_handler ctrl_handler;
++	struct v4l2_ctrl *exposure;
++	struct v4l2_ctrl *vblank;
++};
++
++#define to_sc2336(_sd)			container_of(_sd, struct sc2336, sd)
++
++/* Split a total gain (32 = 1x) into coarse analogue, coarse and fine digital */
++static int sc2336_set_gain(struct sc2336 *sc2336, u32 gain)
++{
++	u32 again, dgain = 0, fine;
++	u32 factor = gain * 1000 / 32;	/* gain in 1/1000 */
++	int ret = 0;
++
++	if (factor < 1000) {
++		again = 0x00;
++		fine = 0x80;
++	} else if (factor < 2 * 1000) {
++		again = 0x00;
++		fine = factor * 128 / 1000;
++	} else if (factor < 4 * 1000) {
++		again = 0x08;
++		fine = factor * 128 / 1000 / 2;
++	} else if (factor < 8 * 1000) {
++		again = 0x09;
++		fine = factor * 128 / 1000 / 4;
++	} else if (factor < 16 * 1000) {
++		again = 0x0b;
++		fine = factor * 128 / 1000 / 8;
++	} else if (factor < 32 * 1000) {
++		again = 0x0f;
++		fine = factor * 128 / 1000 / 16;
++	} else if (factor < 64 * 1000) {
++		/* maximum analogue gain, digital gain from here */
++		again = 0x1f;
++		fine = factor * 128 / 1000 / 32;
++	} else if (factor < 128 * 1000) {
++		again = 0x1f;
++		dgain = 0x01;
++		fine = factor * 128 / 1000 / 64;
++	} else {
++		again = 0x1f;
++		dgain = 0x03;
++		fine = 0x80;
++	}
++	fine &= ~3;
++
++	cci_write(sc2336->regmap, SC2336_REG_DIG_GAIN, dgain, &ret);
++	cci_write(sc2336->regmap, SC2336_REG_DIG_FINE_GAIN, fine, &ret);
++	cci_write(sc2336->regmap, SC2336_REG_ANA_GAIN, again, &ret);
++
++	return ret;
++}
++
++static int sc2336_set_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct sc2336 *sc2336 = container_of(ctrl->handler, struct sc2336,
++					     ctrl_handler);
++	int ret = 0;
++
++	if (ctrl->id == V4L2_CID_VBLANK) {
++		/* Update max exposure while meeting expected vblanking */
++		s64 max = SC2336_NATIVE_HEIGHT + ctrl->val -
++			  SC2336_EXPOSURE_MARGIN;
++
++		ret = __v4l2_ctrl_modify_range(sc2336->exposure,
++					       sc2336->exposure->minimum, max,
++					       sc2336->exposure->step,
++					       sc2336->exposure->default_value);
++		if (ret)
++			return ret;
++	}
++
++	/* Applied when streaming starts if the sensor is powered off now */
++	if (!pm_runtime_get_if_in_use(sc2336->dev))
++		return 0;
++
++	switch (ctrl->id) {
++	case V4L2_CID_EXPOSURE:
++		cci_write(sc2336->regmap, SC2336_REG_EXPOSURE,
++			  (u32)ctrl->val << 4, &ret);
++		break;
++	case V4L2_CID_ANALOGUE_GAIN:
++		ret = sc2336_set_gain(sc2336, ctrl->val);
++		break;
++	case V4L2_CID_VBLANK:
++		cci_write(sc2336->regmap, SC2336_REG_VTS,
++			  SC2336_NATIVE_HEIGHT + ctrl->val, &ret);
++		break;
++	case V4L2_CID_TEST_PATTERN:
++		cci_update_bits(sc2336->regmap, SC2336_REG_TEST_PATTERN,
++				SC2336_TEST_PATTERN_ENABLE,
++				ctrl->val ? SC2336_TEST_PATTERN_ENABLE : 0,
++				&ret);
++		break;
++	case V4L2_CID_HFLIP:
++		cci_update_bits(sc2336->regmap, SC2336_REG_FLIP_MIRROR,
++				SC2336_MIRROR, ctrl->val ? SC2336_MIRROR : 0,
++				&ret);
++		break;
++	case V4L2_CID_VFLIP:
++		cci_update_bits(sc2336->regmap, SC2336_REG_FLIP_MIRROR,
++				SC2336_FLIP, ctrl->val ? SC2336_FLIP : 0, &ret);
++		break;
++	default:
++		ret = -EINVAL;
++		break;
++	}
++
++	pm_runtime_put_autosuspend(sc2336->dev);
++
++	return ret;
++}
++
++static const struct v4l2_ctrl_ops sc2336_ctrl_ops = {
++	.s_ctrl = sc2336_set_ctrl,
++};
++
++static int sc2336_init_controls(struct sc2336 *sc2336)
++{
++	struct v4l2_ctrl_handler *hdl = &sc2336->ctrl_handler;
++	const struct v4l2_ctrl_ops *ops = &sc2336_ctrl_ops;
++	struct v4l2_fwnode_device_properties props;
++	struct v4l2_ctrl *ctrl;
++	u32 hblank, vblank;
++	int ret;
++
++	ret = v4l2_fwnode_device_parse(sc2336->dev, &props);
++	if (ret)
++		return ret;
++
++	v4l2_ctrl_handler_init(hdl, 12);
++
++	ctrl = v4l2_ctrl_new_int_menu(hdl, NULL, V4L2_CID_LINK_FREQ,
++				      ARRAY_SIZE(sc2336_link_freq_menu) - 1, 0,
++				      sc2336_link_freq_menu);
++	if (ctrl)
++		ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++
++	v4l2_ctrl_new_std(hdl, NULL, V4L2_CID_PIXEL_RATE, SC2336_PIXEL_RATE,
++			  SC2336_PIXEL_RATE, 1, SC2336_PIXEL_RATE);
++
++	hblank = SC2336_HTS - SC2336_NATIVE_WIDTH;
++	ctrl = v4l2_ctrl_new_std(hdl, NULL, V4L2_CID_HBLANK, hblank, hblank, 1,
++				 hblank);
++	if (ctrl)
++		ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++
++	vblank = SC2336_VTS_DEFAULT - SC2336_NATIVE_HEIGHT;
++	sc2336->vblank = v4l2_ctrl_new_std(hdl, ops, V4L2_CID_VBLANK, vblank,
++					   SC2336_VTS_MAX - SC2336_NATIVE_HEIGHT,
++					   1, vblank);
++
++	sc2336->exposure = v4l2_ctrl_new_std(hdl, ops, V4L2_CID_EXPOSURE,
++					     SC2336_EXPOSURE_MIN,
++					     SC2336_VTS_DEFAULT -
++					     SC2336_EXPOSURE_MARGIN,
++					     1, SC2336_EXPOSURE_DEFAULT);
++
++	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_ANALOGUE_GAIN, SC2336_GAIN_MIN,
++			  SC2336_GAIN_MAX, 1, SC2336_GAIN_DEFAULT);
++
++	v4l2_ctrl_new_std_menu_items(hdl, ops, V4L2_CID_TEST_PATTERN,
++				     ARRAY_SIZE(sc2336_test_pattern_menu) - 1,
++				     0, 0, sc2336_test_pattern_menu);
++
++	/* Bayer order with flip/mirror not verified: format kept as is */
++	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_HFLIP, 0, 1, 1, 0);
++	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_VFLIP, 0, 1, 1, 0);
++
++	v4l2_ctrl_new_fwnode_properties(hdl, ops, &props);
++
++	if (hdl->error) {
++		ret = hdl->error;
++		v4l2_ctrl_handler_free(hdl);
++		return ret;
++	}
++
++	sc2336->sd.ctrl_handler = hdl;
++
++	return 0;
++}
++
++static int sc2336_enable_streams(struct v4l2_subdev *sd,
++				 struct v4l2_subdev_state *state, u32 pad,
++				 u64 streams_mask)
++{
++	struct sc2336 *sc2336 = to_sc2336(sd);
++	int ret;
++
++	ret = pm_runtime_resume_and_get(sc2336->dev);
++	if (ret)
++		return ret;
++
++	ret = cci_multi_reg_write(sc2336->regmap, sc2336_1080p_30fps_regs,
++				  ARRAY_SIZE(sc2336_1080p_30fps_regs), NULL);
++	if (ret) {
++		dev_err(sc2336->dev, "failed to write mode registers\n");
++		goto error;
++	}
++
++	/* Apply controls set while the sensor was powered off */
++	ret = __v4l2_ctrl_handler_setup(&sc2336->ctrl_handler);
++	if (ret)
++		goto error;
++
++	ret = cci_write(sc2336->regmap, SC2336_REG_MODE_SELECT,
++			SC2336_MODE_STREAMING, NULL);
++	if (ret)
++		goto error;
++
++	return 0;
++
++error:
++	pm_runtime_put_autosuspend(sc2336->dev);
++
++	return ret;
++}
++
++static int sc2336_disable_streams(struct v4l2_subdev *sd,
++				  struct v4l2_subdev_state *state, u32 pad,
++				  u64 streams_mask)
++{
++	struct sc2336 *sc2336 = to_sc2336(sd);
++	int ret;
++
++	ret = cci_write(sc2336->regmap, SC2336_REG_MODE_SELECT,
++			SC2336_MODE_STANDBY, NULL);
++
++	pm_runtime_put_autosuspend(sc2336->dev);
++
++	return ret;
++}
++
++static void sc2336_fill_format(struct v4l2_mbus_framefmt *fmt)
++{
++	fmt->code = SC2336_MBUS_CODE;
++	fmt->width = SC2336_NATIVE_WIDTH;
++	fmt->height = SC2336_NATIVE_HEIGHT;
++	fmt->field = V4L2_FIELD_NONE;
++	fmt->colorspace = V4L2_COLORSPACE_RAW;
++	fmt->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
++	fmt->quantization = V4L2_QUANTIZATION_FULL_RANGE;
++	fmt->xfer_func = V4L2_XFER_FUNC_NONE;
++}
++
++/* Only one mode: any requested format is replaced by the native one */
++static int sc2336_set_pad_format(struct v4l2_subdev *sd,
++				 struct v4l2_subdev_state *state,
++				 struct v4l2_subdev_format *fmt)
++{
++	sc2336_fill_format(&fmt->format);
++	*v4l2_subdev_state_get_format(state, fmt->pad) = fmt->format;
++
++	return 0;
++}
++
++static int sc2336_enum_mbus_code(struct v4l2_subdev *sd,
++				 struct v4l2_subdev_state *state,
++				 struct v4l2_subdev_mbus_code_enum *code)
++{
++	if (code->index > 0)
++		return -EINVAL;
++
++	code->code = SC2336_MBUS_CODE;
++
++	return 0;
++}
++
++static int sc2336_enum_frame_size(struct v4l2_subdev *sd,
++				  struct v4l2_subdev_state *state,
++				  struct v4l2_subdev_frame_size_enum *fse)
++{
++	if (fse->index > 0 || fse->code != SC2336_MBUS_CODE)
++		return -EINVAL;
++
++	fse->min_width = SC2336_NATIVE_WIDTH;
++	fse->max_width = SC2336_NATIVE_WIDTH;
++	fse->min_height = SC2336_NATIVE_HEIGHT;
++	fse->max_height = SC2336_NATIVE_HEIGHT;
++
++	return 0;
++}
++
++static int sc2336_init_state(struct v4l2_subdev *sd,
++			     struct v4l2_subdev_state *state)
++{
++	sc2336_fill_format(v4l2_subdev_state_get_format(state, 0));
++
++	return 0;
++}
++
++static const struct v4l2_subdev_video_ops sc2336_video_ops = {
++	.s_stream = v4l2_subdev_s_stream_helper,
++};
++
++static const struct v4l2_subdev_pad_ops sc2336_pad_ops = {
++	.get_fmt = v4l2_subdev_get_fmt,
++	.set_fmt = sc2336_set_pad_format,
++	.enum_mbus_code = sc2336_enum_mbus_code,
++	.enum_frame_size = sc2336_enum_frame_size,
++	.enable_streams = sc2336_enable_streams,
++	.disable_streams = sc2336_disable_streams,
++};
++
++static const struct v4l2_subdev_ops sc2336_subdev_ops = {
++	.video = &sc2336_video_ops,
++	.pad = &sc2336_pad_ops,
++};
++
++static const struct v4l2_subdev_internal_ops sc2336_internal_ops = {
++	.init_state = sc2336_init_state,
++};
++
++static const struct media_entity_operations sc2336_entity_ops = {
++	.link_validate = v4l2_subdev_link_validate,
++};
++
++static int sc2336_power_on(struct device *dev)
++{
++	struct v4l2_subdev *sd = dev_get_drvdata(dev);
++	struct sc2336 *sc2336 = to_sc2336(sd);
++	int ret;
++
++	ret = regulator_bulk_enable(SC2336_NUM_SUPPLIES, sc2336->supplies);
++	if (ret)
++		return ret;
++
++	ret = clk_prepare_enable(sc2336->mclk);
++	if (ret)
++		goto disable_regulators;
++
++	usleep_range(1000, 2000);
++	gpiod_set_value_cansleep(sc2336->reset_gpio, 0);
++	/* 20 ms after reset worked on the board; no datasheet value yet */
++	usleep_range(20 * USEC_PER_MSEC, 25 * USEC_PER_MSEC);
++
++	return 0;
++
++disable_regulators:
++	regulator_bulk_disable(SC2336_NUM_SUPPLIES, sc2336->supplies);
++
++	return ret;
++}
++
++static int sc2336_power_off(struct device *dev)
++{
++	struct v4l2_subdev *sd = dev_get_drvdata(dev);
++	struct sc2336 *sc2336 = to_sc2336(sd);
++
++	gpiod_set_value_cansleep(sc2336->reset_gpio, 1);
++	clk_disable_unprepare(sc2336->mclk);
++	regulator_bulk_disable(SC2336_NUM_SUPPLIES, sc2336->supplies);
++
++	return 0;
++}
++
++static int sc2336_identify(struct sc2336 *sc2336)
++{
++	u64 val;
++	int ret;
++
++	ret = cci_read(sc2336->regmap, SC2336_REG_CHIP_ID, &val, NULL);
++	if (ret)
++		return dev_err_probe(sc2336->dev, ret,
++				     "failed to read chip id\n");
++
++	if (val != SC2336_CHIP_ID)
++		return dev_err_probe(sc2336->dev, -ENODEV,
++				     "chip id mismatch: %#x != %#llx\n",
++				     SC2336_CHIP_ID, val);
++
++	dev_info(sc2336->dev, "SC2336 found, chip id %#llx\n", val);
++
++	return 0;
++}
++
++static int sc2336_probe(struct i2c_client *client)
++{
++	struct sc2336 *sc2336;
++	unsigned long freq;
++	unsigned int i;
++	int ret;
++
++	sc2336 = devm_kzalloc(&client->dev, sizeof(*sc2336), GFP_KERNEL);
++	if (!sc2336)
++		return -ENOMEM;
++
++	sc2336->dev = &client->dev;
++
++	v4l2_i2c_subdev_init(&sc2336->sd, client, &sc2336_subdev_ops);
++
++	sc2336->regmap = devm_cci_regmap_init_i2c(client, 16);
++	if (IS_ERR(sc2336->regmap))
++		return dev_err_probe(sc2336->dev, PTR_ERR(sc2336->regmap),
++				     "failed to init CCI\n");
++
++	sc2336->mclk = devm_v4l2_sensor_clk_get(sc2336->dev, NULL);
++	if (IS_ERR(sc2336->mclk))
++		return dev_err_probe(sc2336->dev, PTR_ERR(sc2336->mclk),
++				     "failed to get MCLK\n");
++
++	freq = clk_get_rate(sc2336->mclk);
++	if (freq != SC2336_MCLK_FREQ_24MHZ)
++		return dev_err_probe(sc2336->dev, -EINVAL,
++				     "MCLK frequency %lu Hz is not supported\n",
++				     freq);
++
++	sc2336->reset_gpio = devm_gpiod_get_optional(sc2336->dev, "reset",
++						     GPIOD_OUT_HIGH);
++	if (IS_ERR(sc2336->reset_gpio))
++		return dev_err_probe(sc2336->dev, PTR_ERR(sc2336->reset_gpio),
++				     "failed to get reset GPIO\n");
++
++	for (i = 0; i < SC2336_NUM_SUPPLIES; i++)
++		sc2336->supplies[i].supply = sc2336_supply_names[i];
++
++	ret = devm_regulator_bulk_get(sc2336->dev, SC2336_NUM_SUPPLIES,
++				      sc2336->supplies);
++	if (ret)
++		return dev_err_probe(sc2336->dev, ret,
++				     "failed to get supplies\n");
++
++	/* The sensor must be powered on to read the chip ID */
++	ret = sc2336_power_on(sc2336->dev);
++	if (ret)
++		return ret;
++
++	ret = sc2336_identify(sc2336);
++	if (ret)
++		goto power_off;
++
++	ret = sc2336_init_controls(sc2336);
++	if (ret) {
++		dev_err_probe(sc2336->dev, ret, "failed to init controls\n");
++		goto power_off;
++	}
++
++	sc2336->sd.state_lock = sc2336->ctrl_handler.lock;
++	sc2336->sd.internal_ops = &sc2336_internal_ops;
++	sc2336->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
++	sc2336->sd.entity.ops = &sc2336_entity_ops;
++	sc2336->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
++	sc2336->pad.flags = MEDIA_PAD_FL_SOURCE;
++
++	ret = media_entity_pads_init(&sc2336->sd.entity, 1, &sc2336->pad);
++	if (ret) {
++		dev_err_probe(sc2336->dev, ret, "failed to init entity pads\n");
++		goto free_ctrls;
++	}
++
++	ret = v4l2_subdev_init_finalize(&sc2336->sd);
++	if (ret) {
++		dev_err_probe(sc2336->dev, ret, "failed to init subdev\n");
++		goto entity_cleanup;
++	}
++
++	pm_runtime_set_active(sc2336->dev);
++	pm_runtime_enable(sc2336->dev);
++
++	ret = v4l2_async_register_subdev_sensor(&sc2336->sd);
++	if (ret) {
++		dev_err_probe(sc2336->dev, ret, "failed to register subdev\n");
++		goto subdev_cleanup;
++	}
++
++	/* Let runtime PM power the sensor down until it is used */
++	pm_runtime_set_autosuspend_delay(sc2336->dev, 1000);
++	pm_runtime_use_autosuspend(sc2336->dev);
++	pm_runtime_idle(sc2336->dev);
++
++	return 0;
++
++subdev_cleanup:
++	v4l2_subdev_cleanup(&sc2336->sd);
++	pm_runtime_disable(sc2336->dev);
++	pm_runtime_set_suspended(sc2336->dev);
++entity_cleanup:
++	media_entity_cleanup(&sc2336->sd.entity);
++free_ctrls:
++	v4l2_ctrl_handler_free(&sc2336->ctrl_handler);
++power_off:
++	sc2336_power_off(sc2336->dev);
++
++	return ret;
++}
++
++static void sc2336_remove(struct i2c_client *client)
++{
++	struct v4l2_subdev *sd = i2c_get_clientdata(client);
++	struct sc2336 *sc2336 = to_sc2336(sd);
++
++	v4l2_async_unregister_subdev(sd);
++	v4l2_subdev_cleanup(sd);
++	media_entity_cleanup(&sd->entity);
++	v4l2_ctrl_handler_free(&sc2336->ctrl_handler);
++	pm_runtime_disable(sc2336->dev);
++
++	if (!pm_runtime_status_suspended(sc2336->dev)) {
++		sc2336_power_off(sc2336->dev);
++		pm_runtime_set_suspended(sc2336->dev);
++	}
++}
++
++static DEFINE_RUNTIME_DEV_PM_OPS(sc2336_pm_ops, sc2336_power_off,
++				 sc2336_power_on, NULL);
++
++static const struct of_device_id sc2336_of_match[] = {
++	{ .compatible = "smartsens,sc2336" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, sc2336_of_match);
++
++static struct i2c_driver sc2336_i2c_driver = {
++	.driver = {
++		.name = "sc2336",
++		.pm = pm_ptr(&sc2336_pm_ops),
++		.of_match_table = sc2336_of_match,
++	},
++	.probe = sc2336_probe,
++	.remove = sc2336_remove,
++};
++
++module_i2c_driver(sc2336_i2c_driver);
++
++MODULE_DESCRIPTION("SmartSens SC2336 image sensor driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/media/platform/Kconfig b/drivers/media/platform/Kconfig
+index 9287faa..a41f936 100644
+--- a/drivers/media/platform/Kconfig
++++ b/drivers/media/platform/Kconfig
+@@ -70,6 +70,7 @@ source "drivers/media/platform/atmel/Kconfig"
+ source "drivers/media/platform/broadcom/Kconfig"
+ source "drivers/media/platform/cadence/Kconfig"
+ source "drivers/media/platform/chips-media/Kconfig"
++source "drivers/media/platform/fullhan/Kconfig"
+ source "drivers/media/platform/imagination/Kconfig"
+ source "drivers/media/platform/intel/Kconfig"
+ source "drivers/media/platform/marvell/Kconfig"
+diff --git a/drivers/media/platform/Makefile b/drivers/media/platform/Makefile
+index 6fd7db0..96f1d45 100644
+--- a/drivers/media/platform/Makefile
++++ b/drivers/media/platform/Makefile
+@@ -13,6 +13,7 @@ obj-y += atmel/
+ obj-y += broadcom/
+ obj-y += cadence/
+ obj-y += chips-media/
++obj-y += fullhan/
+ obj-y += imagination/
+ obj-y += intel/
+ obj-y += marvell/
+diff --git a/drivers/media/platform/fullhan/Kconfig b/drivers/media/platform/fullhan/Kconfig
+new file mode 100644
+index 0000000..611f9bf
+--- /dev/null
++++ b/drivers/media/platform/fullhan/Kconfig
+@@ -0,0 +1,32 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++comment "Fullhan media platform drivers"
++
++config VIDEO_FH8626_ISP_BRINGUP
++	tristate "Fullhan FH8626V200 ISP bring-up helper"
++	depends on ARCH_FH8626 || COMPILE_TEST
++	depends on OF && HAS_IOMEM
++	help
++	  Interrupt service for bringing up the FH8626V200 ISP from user
++	  space: acknowledges the ISP interrupt, switches the statistics
++	  buffer and re-arms the raw dump in every frame, and exposes
++	  counters through sysfs. Not a capture driver.
++
++	  If unsure, say N.
++
++config VIDEO_FH8626_CAMERA
++	tristate "Fullhan FH8626V200 camera (CSI-2 receiver, ISP, VPU)"
++	depends on ARCH_FH8626 || COMPILE_TEST
++	depends on OF && HAS_IOMEM && VIDEO_DEV
++	select MEDIA_CONTROLLER
++	select VIDEO_V4L2_SUBDEV_API
++	select V4L2_FWNODE
++	select VIDEOBUF2_DMA_CONTIG
++	select MFD_SYSCON
++	help
++	  Video capture driver for the FH8626V200 camera path: MIPI CSI-2
++	  receiver, ISP and VPU channel 0, delivering 1920x1088 NV12 from
++	  a raw Bayer sensor such as the SC2336.
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called fh8626-camera.
+diff --git a/drivers/media/platform/fullhan/Makefile b/drivers/media/platform/fullhan/Makefile
+new file mode 100644
+index 0000000..8ec1531
+--- /dev/null
++++ b/drivers/media/platform/fullhan/Makefile
+@@ -0,0 +1,3 @@
++# SPDX-License-Identifier: GPL-2.0-only
++obj-$(CONFIG_VIDEO_FH8626_ISP_BRINGUP) += fh8626-isp-bringup.o
++obj-$(CONFIG_VIDEO_FH8626_CAMERA) += fh8626-camera.o
+diff --git a/drivers/media/platform/fullhan/fh8626-camera.c b/drivers/media/platform/fullhan/fh8626-camera.c
+new file mode 100644
+index 0000000..04bff31
+--- /dev/null
++++ b/drivers/media/platform/fullhan/fh8626-camera.c
+@@ -0,0 +1,1767 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Fullhan FH8626V200 camera: MIPI CSI-2 receiver, ISP and VPU channel 0
++ *
++ * One video capture node delivering 1920x1088 NV12 from a raw Bayer sensor
++ * on two CSI-2 lanes (SC2336). The ISP setup is a fixed list of neutral
++ * values: linear tone curves, a power-law gamma, fixed white balance and
++ * black level.
++ *
++ * Auto exposure (V4L2_CID_EXPOSURE_AUTO on the video node, on by default):
++ * every AE_PERIOD frames the interrupt handler samples the mean luma of the
++ * completed frame (a grid of AE_GRID_W x AE_GRID_H points), and a work item
++ * sets the sensor exposure and analogue gain through the sensor's controls.
++ * Exposure time comes first, gain only above the longest exposure; above
++ * 10 ms the time is a multiple of 10 ms (50 Hz light). The target mean is
++ * the module parameter ae_target. In manual mode the sensor controls are
++ * left alone (set them on the sensor subdevice).
++ *
++ * Auto white balance (V4L2_CID_AUTO_WHITE_BALANCE, on by default), gray
++ * world on the same samples: the mean Cb/Cr of near-gray points (mid luma,
++ * low chroma; all mid-luma points while too few look gray) is driven to zero by adjusting the red and blue gains
++ * directly in the ISP, from the interrupt handler. V4L2_CID_RED_BALANCE and
++ * V4L2_CID_BLUE_BALANCE (0x200 = 1.0) show the current gains while AWB is
++ * on and set them while it is off.
++ *
++ * V4L2_CID_SATURATION (0-255, 128 = the neutral colour gain 0x100, 0 = grey)
++ * sets the ISP colour gain, e.g. for monochrome night images.
++ *
++ * Every register value comes from the bisects documented in docs/CAM.md of
++ * the firmware project; none is taken from vendor tuning tables.
++ *
++ * Formats: NV12 (the VPU output) and MJPEG. For MJPEG the VPU writes into two
++ * internal NV12 frames in turn; at each frame end the on-chip JPEG encoder
++ * (0xE8300000) compresses the finished one into the next queued buffer. Its
++ * tables are the standard ones of ITU-T T.81 Annex K, computed at probe
++ * (Huffman) and per quality setting (V4L2_CID_JPEG_COMPRESSION_QUALITY).
++ *
++ * Buffers: VPU channel 0 writes Y and interleaved CbCr to two addresses
++ * (+0x1350/+0x1354). Rewriting them while the channel runs moves the next
++ * frame to the new buffer; switching the channel off and on per frame (as
++ * the vendor driver does) breaks luma, so the channel stays enabled. On
++ * ISPF END (status bit 1) the driver completes the current buffer and
++ * points the channel at the next queued one. Without a queued buffer the
++ * current one is overwritten by the next frame (frame dropped).
++ *
++ * The output is 1088 lines high: the VPU channel height is aligned to 16
++ * lines, and the 1080 sensor lines are scaled onto them (vertical step
++ * 1080/1088).
++ */
++
++#include <linux/bitfield.h>
++#include <linux/bits.h>
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/mfd/syscon.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_graph.h>
++#include <linux/of_reserved_mem.h>
++#include <linux/platform_device.h>
++#include <linux/property.h>
++#include <linux/regmap.h>
++#include <linux/sizes.h>
++#include <linux/spinlock.h>
++#include <linux/workqueue.h>
++
++#include <media/media-device.h>
++#include <media/v4l2-async.h>
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-device.h>
++#include <media/v4l2-fwnode.h>
++#include <media/v4l2-ioctl.h>
++#include <media/v4l2-mc.h>
++#include <media/v4l2-subdev.h>
++#include <media/videobuf2-dma-contig.h>
++
++#define DRV_NAME		"fh8626-camera"
++
++/* Frame geometry */
++#define FH_IN_W			1920
++#define FH_IN_H			1080
++#define FH_OUT_W		FH_IN_W
++#define FH_OUT_H		ALIGN(FH_IN_H, 16)		/* 1088 */
++#define FH_Y_SIZE		(FH_OUT_W * FH_OUT_H)
++#define FH_FRAME_SIZE		(FH_Y_SIZE * 3 / 2)
++#define FH_RAW_STRIDE		(ALIGN(FH_IN_W * 10, 64) / 8)	/* 2400 */
++/* Unused VPU channels 1 and 2 still need a valid size (any) */
++#define FH_AUX_W		640
++#define FH_AUX_H		360
++#define FH_SCALE_ONE		BIT(20)
++
++/* PMU (syscon) */
++#define PMU_GATE0		0x1c	/* bit set = clock off */
++#define PMU_GATE0_JPEG_ADAPT	BIT(29)
++#define PMU_GATE1		0x20
++#define PMU_GATE1_JPG_HCLK	BIT(31)
++#define PMU_GATE1_JPEG		BIT(30)	/* jpeg_clk, divider +0x5c[21:16] */
++#define PMU_GATE1_MIPI_WRAP	BIT(29)
++#define PMU_GATE1_PIX		BIT(23)
++#define PMU_GATE1_ADAPT_HCLK	BIT(1)
++#define PMU_CLK_DIV_ISP		0x24
++#define PMU_ISP_ACLK_DIV	GENMASK(13, 8)	/* 1500 MHz / (n + 1) */
++#define PMU_CLK_DIV_PIX		0x2c
++#define PMU_PIX_DIV		GENMASK(27, 24)
++#define PMU_RESET		0x4c	/* bit clear = out of reset */
++#define PMU_RESET_MIPI_WRAP	BIT(13)
++#define PMU_RESET_MIPI_CSI	BIT(14)
++#define PMU_GATE2		0x5c
++#define PMU_GATE2_VEU_ADAPT	(BIT(26) | BIT(27))
++#define PMU_GATE2_VEU_HCLK	BIT(25)
++#define PMU_GATE2_MIPI_DPHY	BIT(6)
++#define PMU_GATE2_MIPI_CFG	BIT(4)
++#define PMU_MIPI_CTRL		0x2108
++#define PMU_MIPI_CTRL_EN	BIT(4)
++
++/* MIPI wrap (between CSI-2 host and ISP) */
++#define WRAP_CFG		0x00
++#define WRAP_CFG_RESET		0x06800004
++#define WRAP_CFG_RUN		0x04800004
++#define WRAP_DT			0x04
++#define WRAP_DT_RAW10_FLAGS	0x79
++#define WRAP_EN			0x08
++#define WRAP_SOFT_RESET		0x10
++
++/* Synopsys DesignWare CSI-2 host */
++#define CSI_N_LANES		0x04
++#define CSI_RESETN		0x08
++#define CSI_PHY_SHUTDOWNZ	0x40
++#define CSI_DPHY_RSTZ		0x44
++static const u16 csi_int_masks[] = { 0xe4, 0xf4, 0x104, 0x114, 0x124, 0x134 };
++
++/* Fullhan D-PHY settings */
++#define DPHY_EN			0x04
++#define DPHY_LANE_CFG		0x20
++#define DPHY_LANE_EN		0x24
++#define DPHY_FREQ		0x28	/* one byte per lane */
++#define DPHY_FREQ_300_499	8
++#define DPHY_TIMEOUT(n)		(0x30 + 4 * (n))	/* n = 0..4 */
++
++/* ISP */
++#define ISP_INPUT		0x028	/* [4:3] Bayer phase, bits 9 and 12 */
++#define ISP_INPUT_RGGB_FLIP	0x00001210
++#define ISP_PIPE_CTRL		0x034
++#define ISP_RESET		0x040
++#define ISP_RESET_DONE		0x044
++#define ISP_INT_STATUS		0x004	/* write 1 to clear */
++#define ISP_INT_ENABLE		0x008	/* write-only */
++#define ISP_INT_ISPF_END	BIT(1)
++#define ISP_PKG_ENABLE		0x100
++#define ISP_BLC_0		0x13c
++#define ISP_BLC_1		0x140
++#define ISP_BLC_LEVEL		0x42
++#define ISP_WB_BG		0x570	/* [15:0] B, [31:16] G, 0x200 = 1.0 */
++#define ISP_WB_GR		0x574	/* [15:0] G, [31:16] R */
++#define ISP_DRC_CTRL		0x590	/* must be set before the start */
++#define ISP_SAT			0x600	/* [8:0] colour gain, 0 = grey */
++#define ISP_GAMMA		0x690	/* 256 x 16 bit */
++#define ISP_GAMMA_CTRL		0x890
++#define ISP_CONTRAST		0xe00	/* 0x40 = 1.0 */
++#define ISP_YC_CTRL		0xe0c
++#define ISP_YC_CHROMA_ON	0x00010000
++#define ISP_TONE(t)		(0x1a40 + 0x140 * (t))	/* 4 x 160 entries */
++
++/* VPU (inside the ISP register space) */
++#define VPU_CTRL		0x030
++#define VPU_CTRL_BASE		0x0086df83
++#define VPU_CTRL_CHN(c)		BIT(20 + (c))
++#define VPU_VI_SIZE(c)		(0xf04 + 0x38 * (c))
++#define VPU_VI_SIZE2(c)		(0xf0c + 0x38 * (c))
++#define VPU_CHN_W(c)		(0xf08 + 0x38 * (c))
++#define VPU_CHN_H(c)		(0xf10 + 0x38 * (c))
++#define VPU_CHN_SCALE(c)	(0xf14 + 0x38 * (c))	/* 3 words */
++#define VPU_CHN_STEP(c)		(0xf2c + 0x38 * (c))	/* h, h, v, v */
++#define VPU_CHN_OFFSET(c)	(0x1200 + 8 * (c))
++#define VPU_CHN_SIZE(c)		(0x1204 + 8 * (c))
++#define VPU_CHN0_MODE		0x0e8
++#define VPU_CHN0_STRIDE		0x1358
++#define VPU_CHN0_Y		0x1350
++#define VPU_CHN0_C		0x1354
++#define VPU_MEAN_Y_ADDR		0xed4
++#define VPU_MEAN_Y_CFG		0xed8
++#define VPU_MEAN_C_ADDR		0xedc
++#define VPU_MEAN_C_CFG		0xee0
++#define VPU_SAD_ADDR		0x12dc
++#define VPU_SAD_CFG		0x12e0
++#define VPU_COEF_BANK(b)	(0x1f40 + 0x200 * (b))	/* 4 x 64 phases */
++
++#define AUX_BUF_SIZE		SZ_64K
++
++/* JPEG encoder */
++#define JPEG_ID			0x000	/* reads 0x00038401 */
++#define JPEG_STATUS		0x004	/* bit 0: done; write 1 to clear */
++#define JPEG_STATUS_DONE	BIT(0)
++#define JPEG_MODE		0x008
++#define JPEG_LENGTH		0x00c	/* bytes written */
++#define JPEG_START		0x010
++#define JPEG_SIZE_A		0x014
++#define JPEG_SIZE_B		0x01c
++#define JPEG_DST0		0x034
++#define JPEG_DST1		0x038
++#define JPEG_SRC_Y		0x03c
++#define JPEG_SRC_C		0x040
++#define JPEG_MB			0x044
++#define JPEG_STRIDE		0x04c
++#define JPEG_DST_SIZE0		0x050
++#define JPEG_DST_SIZE1		0x054
++#define JPEG_INPUT		0x058
++#define JPEG_INPUT_NV12		(2 << 4)	/* linear semi-planar 4:2:0 */
++#define JPEG_CTRL		0x05c
++#define JPEG_BURST		0x064
++#define JPEG_RESET		0x06c
++#define JPEG_RESET_BUSY		0x070
++#define JPEG_QTAB		0x080	/* 64 luma + 64 chroma bytes, zigzag */
++#define JPEG_HUFF		0x100	/* encoder code table, 768 bytes */
++#define JPEG_DHT		0x400	/* DHT payload, 412 bytes */
++#define JPEG_BUF_SIZE		SZ_1M	/* per MJPEG buffer */
++#define JPEG_QUALITY_DEFAULT	75
++
++/* ITU-T T.81 Annex K: Huffman tables (bits, values) and quantisation tables */
++static const u8 jpeg_dc_l_bits[16] = { 0, 1, 5, 1, 1, 1, 1, 1, 1 };
++static const u8 jpeg_dc_c_bits[16] = { 0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
++static const u8 jpeg_ac_l_bits[16] = { 0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7d };
++static const u8 jpeg_ac_c_bits[16] = { 0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 0x77 };
++static const u8 jpeg_ac_l_vals[162] = {
++	0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06,
++	0x13, 0x51, 0x61, 0x07, 0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xa1, 0x08,
++	0x23, 0x42, 0xb1, 0xc1, 0x15, 0x52, 0xd1, 0xf0, 0x24, 0x33, 0x62, 0x72,
++	0x82, 0x09, 0x0a, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x25, 0x26, 0x27, 0x28,
++	0x29, 0x2a, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44, 0x45,
++	0x46, 0x47, 0x48, 0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59,
++	0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x73, 0x74, 0x75,
++	0x76, 0x77, 0x78, 0x79, 0x7a, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
++	0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0xa2, 0xa3,
++	0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6,
++	0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9,
++	0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe1, 0xe2,
++	0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf1, 0xf2, 0xf3, 0xf4,
++	0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa,
++};
++static const u8 jpeg_ac_c_vals[162] = {
++	0x00, 0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21, 0x31, 0x06, 0x12, 0x41,
++	0x51, 0x07, 0x61, 0x71, 0x13, 0x22, 0x32, 0x81, 0x08, 0x14, 0x42, 0x91,
++	0xa1, 0xb1, 0xc1, 0x09, 0x23, 0x33, 0x52, 0xf0, 0x15, 0x62, 0x72, 0xd1,
++	0x0a, 0x16, 0x24, 0x34, 0xe1, 0x25, 0xf1, 0x17, 0x18, 0x19, 0x1a, 0x26,
++	0x27, 0x28, 0x29, 0x2a, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44,
++	0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58,
++	0x59, 0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x73, 0x74,
++	0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
++	0x88, 0x89, 0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a,
++	0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4,
++	0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7,
++	0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda,
++	0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf2, 0xf3, 0xf4,
++	0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa,
++};
++static const u8 jpeg_q_l[64] = {
++	16, 11, 10, 16, 24, 40, 51, 61, 12, 12, 14, 19, 26, 58, 60, 55,
++	14, 13, 16, 24, 40, 57, 69, 56, 14, 17, 22, 29, 51, 87, 80, 62,
++	18, 22, 37, 56, 68, 109, 103, 77, 24, 35, 55, 64, 81, 104, 113, 92,
++	49, 64, 78, 87, 103, 121, 120, 101, 72, 92, 95, 98, 112, 100, 103, 99,
++};
++static const u8 jpeg_q_c[64] = {
++	17, 18, 24, 47, 99, 99, 99, 99, 18, 21, 26, 66, 99, 99, 99, 99,
++	24, 26, 56, 99, 99, 99, 99, 99, 47, 66, 99, 99, 99, 99, 99, 99,
++	99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99,
++	99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99,
++};
++static const u8 jpeg_zigzag[64] = {
++	0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5,
++	12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28,
++	35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
++	58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
++};
++
++/* Auto exposure */
++#define AE_PERIOD		3	/* frames; the sensor applies a new value 1-2 frames later */
++#define AE_GRID_W		32
++#define AE_GRID_H		18
++#define AE_DEADBAND		6	/* mean luma */
++#define AE_FLICKER_LINES	360	/* 10 ms at 27.8 us per line (HTS 2250, 81 MHz) */
++#define AE_GAIN_ONE		32	/* sensor analogue gain unit */
++#define AE_GAIN_MAX		(16 * AE_GAIN_ONE)
++
++/* Auto white balance: gains with 0x200 = 1.0 */
++#define WB_ONE			0x200
++#define WB_MIN			0x080
++#define WB_MAX			0x1000
++#define WB_R_DEFAULT		0x29a	/* 1.3, fluorescent light */
++#define WB_B_DEFAULT		0x700	/* 3.5 */
++#define AWB_Y_MIN		40	/* near-gray points: mid luma ... */
++#define AWB_Y_MAX		220
++#define AWB_C_MAX		24	/* ... and |Cb| + |Cr| below this */
++#define AWB_MIN_POINTS		32
++#define AWB_DEADBAND_Q4		6	/* mean |Cb|, |Cr| below 6/16 */
++#define AWB_STEP_MAX_Q8		16	/* at most 1/16 per step */
++
++static unsigned int ae_target = 110;
++module_param(ae_target, uint, 0644);
++MODULE_PARM_DESC(ae_target, "auto exposure: target mean luma (0-255), default 110");
++
++struct fh_cam_reg {
++	u16 off;
++	u32 val;
++};
++
++#define SIZE(w, h)		((((h) - 1) << 16) | ((w) - 1))
++
++/*
++ * Line buffer strides and windows (SetIspPicSize). Partly understood:
++ * 2400 = RAW10 stride, 640 = width / 3, 600 = stride / 4.
++ */
++static const struct fh_cam_reg fh_cam_pic_size[] = {
++	{ 0x138, SIZE(FH_IN_W, FH_IN_H) },
++	{ 0x14c, SIZE(FH_IN_W, FH_IN_H) },
++	{ 0x0d0, SIZE(FH_IN_W, FH_IN_H) },
++	{ 0x490, 0x20270000 }, { 0x500, 0 }, { 0x504, 0 },
++	{ 0x508, 0x7820783b }, { 0x4e0, 0x0f0f203b }, { 0x4e4, 0 },
++	{ 0x4e8, 0x0001fff1 },
++	{ 0x2e8, FH_RAW_STRIDE }, { 0x2f0, BIT(31) | FH_RAW_STRIDE },
++	{ 0x2f8, FH_IN_W / 3 }, { 0x300, BIT(31) | FH_IN_W / 3 },
++	{ 0x308, FH_RAW_STRIDE / 4 }, { 0x310, BIT(31) | FH_RAW_STRIDE / 4 },
++	{ 0x318, FH_RAW_STRIDE / 4 }, { 0x320, BIT(31) | FH_RAW_STRIDE / 4 },
++	{ 0x41c, FH_RAW_STRIDE / 4 }, { 0xaa8, FH_RAW_STRIDE / 4 },
++	{ 0x648, 0x80000348 }, { 0x658, 0x80000348 },
++};
++
++/* x^1.7 in 16 bit (scripts/cam-own-regs.py --gamma-c) */
++static const u16 fh_cam_gamma[256] = {
++	0x0000, 0x0005, 0x0011, 0x0022, 0x0038, 0x0052, 0x0070, 0x0091,
++	0x00b6, 0x00df, 0x010a, 0x0139, 0x016b, 0x01a0, 0x01d8, 0x0213,
++	0x0250, 0x0290, 0x02d3, 0x0319, 0x0361, 0x03ac, 0x03f9, 0x0449,
++	0x049c, 0x04f0, 0x0547, 0x05a1, 0x05fd, 0x065b, 0x06bc, 0x071f,
++	0x0784, 0x07eb, 0x0854, 0x08c0, 0x092e, 0x099e, 0x0a10, 0x0a85,
++	0x0afb, 0x0b73, 0x0bee, 0x0c6b, 0x0ce9, 0x0d6a, 0x0ded, 0x0e72,
++	0x0ef8, 0x0f81, 0x100c, 0x1098, 0x1127, 0x11b7, 0x124a, 0x12de,
++	0x1375, 0x140d, 0x14a7, 0x1543, 0x15e0, 0x1680, 0x1721, 0x17c5,
++	0x186a, 0x1911, 0x19b9, 0x1a64, 0x1b10, 0x1bbe, 0x1c6e, 0x1d20,
++	0x1dd3, 0x1e88, 0x1f3f, 0x1ff8, 0x20b2, 0x216e, 0x222c, 0x22ec,
++	0x23ad, 0x2470, 0x2534, 0x25fb, 0x26c3, 0x278c, 0x2858, 0x2925,
++	0x29f3, 0x2ac4, 0x2b96, 0x2c69, 0x2d3e, 0x2e15, 0x2eee, 0x2fc8,
++	0x30a3, 0x3181, 0x3260, 0x3340, 0x3422, 0x3506, 0x35eb, 0x36d2,
++	0x37ba, 0x38a4, 0x3990, 0x3a7d, 0x3b6c, 0x3c5c, 0x3d4e, 0x3e41,
++	0x3f36, 0x402c, 0x4124, 0x421d, 0x4318, 0x4415, 0x4513, 0x4612,
++	0x4713, 0x4816, 0x491a, 0x4a20, 0x4b27, 0x4c2f, 0x4d39, 0x4e44,
++	0x4f51, 0x5060, 0x5170, 0x5281, 0x5394, 0x54a8, 0x55be, 0x56d5,
++	0x57ee, 0x5908, 0x5a23, 0x5b40, 0x5c5f, 0x5d7f, 0x5ea0, 0x5fc3,
++	0x60e7, 0x620c, 0x6333, 0x645c, 0x6586, 0x66b1, 0x67dd, 0x690c,
++	0x6a3b, 0x6b6c, 0x6c9e, 0x6dd2, 0x6f07, 0x703d, 0x7175, 0x72ae,
++	0x73e9, 0x7525, 0x7662, 0x77a1, 0x78e1, 0x7a22, 0x7b65, 0x7ca9,
++	0x7def, 0x7f36, 0x807e, 0x81c8, 0x8313, 0x845f, 0x85ad, 0x86fc,
++	0x884c, 0x899e, 0x8af1, 0x8c45, 0x8d9b, 0x8ef2, 0x904a, 0x91a4,
++	0x92ff, 0x945b, 0x95b9, 0x9718, 0x9878, 0x99da, 0x9b3d, 0x9ca1,
++	0x9e07, 0x9f6d, 0xa0d6, 0xa23f, 0xa3aa, 0xa516, 0xa683, 0xa7f2,
++	0xa962, 0xaad3, 0xac45, 0xadb9, 0xaf2e, 0xb0a5, 0xb21c, 0xb395,
++	0xb50f, 0xb68b, 0xb808, 0xb986, 0xbb05, 0xbc85, 0xbe07, 0xbf8a,
++	0xc10f, 0xc294, 0xc41b, 0xc5a3, 0xc72d, 0xc8b7, 0xca43, 0xcbd0,
++	0xcd5f, 0xceee, 0xd07f, 0xd211, 0xd3a5, 0xd539, 0xd6cf, 0xd866,
++	0xd9fe, 0xdb98, 0xdd33, 0xdecf, 0xe06c, 0xe20a, 0xe3aa, 0xe54b,
++	0xe6ed, 0xe891, 0xea35, 0xebdb, 0xed82, 0xef2a, 0xf0d4, 0xf27e,
++	0xf42a, 0xf5d7, 0xf786, 0xf935, 0xfae6, 0xfc98, 0xfe4b, 0xffff,
++};
++
++struct fh_cam_buffer {
++	struct vb2_v4l2_buffer vb;
++	struct list_head list;
++};
++
++struct fh_cam {
++	struct device *dev;
++	void __iomem *isp;
++	void __iomem *wrap;
++	void __iomem *csi;
++	void __iomem *dphy;
++	void __iomem *jpeg;
++	struct regmap *pmu;
++	int irq;
++	int jpeg_irq;
++
++	struct v4l2_device v4l2_dev;
++	struct media_device mdev;
++	struct video_device vdev;
++	struct media_pad pad;
++	struct v4l2_async_notifier notifier;
++	struct v4l2_subdev *sensor;
++	u32 sensor_pad;
++
++	struct vb2_queue queue;
++	struct mutex lock;		/* serialises ioctls and the queue */
++
++	spinlock_t irqlock;		/* protects the members below */
++	struct list_head pending;
++	struct fh_cam_buffer *cur;	/* written by the running frame */
++	u32 sequence;
++	bool streaming;
++	u32 pixfmt;			/* V4L2_PIX_FMT_NV12 or _MJPEG */
++
++	/* MJPEG: internal NV12 frames, the encoder job (under irqlock) */
++	void *nv_cpu[2];
++	dma_addr_t nv_dma[2];
++	unsigned int nv_cur;		/* written by the running frame */
++	struct fh_cam_buffer *jpeg_job;
++	bool jpeg_irq_seen;
++	u8 qtab[128];
++	u8 huff[768];
++	u8 dht[412];
++
++	struct page *aux_page;
++	dma_addr_t aux_dma;
++
++	struct v4l2_ctrl_handler ctrls;
++	struct v4l2_ctrl *sensor_exposure;
++	struct v4l2_ctrl *sensor_gain;
++	struct work_struct ae_work;
++	bool ae_on;			/* under irqlock */
++	unsigned int ae_mean;		/* under irqlock, from the last sample */
++
++	struct v4l2_ctrl *awb;		/* cluster: awb, red, blue */
++	struct v4l2_ctrl *red;
++	struct v4l2_ctrl *blue;
++	bool awb_on;			/* under irqlock */
++	u32 wb_r, wb_b;			/* under irqlock, current gains */
++	u32 sat;			/* under irqlock, ISP_SAT value */
++};
++
++struct fh_cam_stats {
++	unsigned int y;			/* mean luma */
++	int cb_q4, cr_q4;		/* mean chroma of near-gray points, x16 */
++	unsigned int gray;		/* number of near-gray points */
++};
++
++static inline void isp_wr(struct fh_cam *cam, u32 off, u32 val)
++{
++	writel(val, cam->isp + off);
++}
++
++static inline u32 isp_rd(struct fh_cam *cam, u32 off)
++{
++	return readl(cam->isp + off);
++}
++
++static void fh_cam_wr_list(struct fh_cam *cam, const struct fh_cam_reg *regs,
++			   unsigned int n)
++{
++	while (n--) {
++		isp_wr(cam, regs->off, regs->val);
++		regs++;
++	}
++}
++
++static inline u32 pack16(u32 lo, u32 hi)
++{
++	return (hi << 16) | lo;
++}
++
++/* ------------------------------------------------------------------------
++ * Hardware setup
++ */
++
++static int fh_cam_clocks_on(struct fh_cam *cam)
++{
++	struct regmap *pmu = cam->pmu;
++	int ret;
++
++	ret = regmap_clear_bits(pmu, PMU_GATE1, PMU_GATE1_PIX | PMU_GATE1_ADAPT_HCLK |
++				PMU_GATE1_MIPI_WRAP);
++	ret = ret ?: regmap_clear_bits(pmu, PMU_GATE2, PMU_GATE2_VEU_ADAPT |
++				       PMU_GATE2_MIPI_DPHY | PMU_GATE2_MIPI_CFG);
++	ret = ret ?: regmap_clear_bits(pmu, PMU_GATE0, PMU_GATE0_JPEG_ADAPT);
++	/*
++	 * isp_aclk 1500/15 = 100 MHz: the back end handles one pixel per
++	 * cycle, 50 MHz loses the end of every line. pix_clk 1500/15.
++	 */
++	ret = ret ?: regmap_update_bits(pmu, PMU_CLK_DIV_ISP, PMU_ISP_ACLK_DIV,
++					FIELD_PREP(PMU_ISP_ACLK_DIV, 14));
++	ret = ret ?: regmap_update_bits(pmu, PMU_CLK_DIV_PIX, PMU_PIX_DIV,
++					FIELD_PREP(PMU_PIX_DIV, 14));
++	ret = ret ?: regmap_clear_bits(pmu, PMU_GATE1, PMU_GATE1_JPG_HCLK | PMU_GATE1_JPEG);
++	ret = ret ?: regmap_clear_bits(pmu, PMU_GATE2, PMU_GATE2_VEU_HCLK);
++
++	return ret;
++}
++
++static int fh_cam_csi_init(struct fh_cam *cam)
++{
++	struct regmap *pmu = cam->pmu;
++	unsigned int i;
++	int ret;
++
++	/* MIPI wrap first, as the stock libmipi does */
++	ret = regmap_clear_bits(pmu, PMU_RESET, PMU_RESET_MIPI_WRAP);
++	if (ret)
++		return ret;
++	writel(WRAP_CFG_RESET, cam->wrap + WRAP_CFG);
++	writel(1, cam->wrap + WRAP_SOFT_RESET);
++	udelay(10);
++	writel(0, cam->wrap + WRAP_SOFT_RESET);
++	writel(WRAP_CFG_RUN, cam->wrap + WRAP_CFG);
++	writel(WRAP_DT_RAW10_FLAGS, cam->wrap + WRAP_DT);
++	writel(1, cam->wrap + WRAP_EN);
++
++	/* CSI-2 host and D-PHY */
++	ret = regmap_set_bits(pmu, PMU_MIPI_CTRL, PMU_MIPI_CTRL_EN);
++	ret = ret ?: regmap_clear_bits(pmu, PMU_RESET, PMU_RESET_MIPI_CSI);
++	if (ret)
++		return ret;
++	writel(1, cam->csi + CSI_PHY_SHUTDOWNZ);
++	writel(1, cam->csi + CSI_DPHY_RSTZ);
++	writel(0xffffffff, cam->csi + CSI_RESETN);
++
++	writel(1, cam->dphy + DPHY_EN);
++	for (i = 0; i < 5; i++)
++		writel(10000, cam->dphy + DPHY_TIMEOUT(i));
++	writel(0x01140114, cam->dphy + DPHY_LANE_CFG);
++	writel(0x01010101, cam->dphy + DPHY_LANE_EN);
++	writel(DPHY_FREQ_300_499 * 0x01010101, cam->dphy + DPHY_FREQ);
++
++	writel(1, cam->csi + CSI_N_LANES);	/* lanes - 1 */
++	for (i = 0; i < ARRAY_SIZE(csi_int_masks); i++)
++		writel(0xffffffff, cam->csi + csi_int_masks[i]);
++
++	return 0;
++}
++
++static int fh_cam_isp_reset(struct fh_cam *cam)
++{
++	unsigned int bit;
++	u32 val;
++	int ret;
++
++	for (bit = 0; bit < 2; bit++) {
++		isp_wr(cam, ISP_RESET, isp_rd(cam, ISP_RESET) | BIT(bit));
++		ret = readl_poll_timeout(cam->isp + ISP_RESET_DONE, val,
++					 val & BIT(bit), 10, 10000);
++		if (ret) {
++			dev_err(cam->dev, "ISP reset %u timed out\n", bit);
++			return ret;
++		}
++	}
++
++	return 0;
++}
++
++/* Channels 1/2 are set up while switched on, then switched off again */
++static void fh_cam_vpu_aux_channel(struct fh_cam *cam, unsigned int c)
++{
++	u32 hstep = DIV_ROUND_CLOSEST(FH_IN_W * FH_SCALE_ONE, FH_AUX_W);
++	u32 vstep = DIV_ROUND_CLOSEST(FH_OUT_H * FH_SCALE_ONE, FH_AUX_H);
++
++	isp_wr(cam, VPU_CHN_W(c), FH_AUX_W - 1);
++	isp_wr(cam, VPU_CHN_H(c), FH_AUX_H - 1);
++	isp_wr(cam, VPU_CHN_OFFSET(c), 0);
++	isp_wr(cam, VPU_CHN_SIZE(c), SIZE(FH_AUX_W, FH_AUX_H));
++	isp_wr(cam, VPU_CHN_STEP(c), hstep);
++	isp_wr(cam, VPU_CHN_STEP(c) + 4, hstep);
++	isp_wr(cam, VPU_CHN_STEP(c) + 8, vstep);
++	isp_wr(cam, VPU_CHN_STEP(c) + 12, vstep);
++	isp_wr(cam, VPU_CHN_SCALE(c), 0);
++	isp_wr(cam, VPU_CHN_SCALE(c) + 4, 0);
++	isp_wr(cam, VPU_CHN_SCALE(c) + 8, 0);
++}
++
++static void fh_cam_isp_setup(struct fh_cam *cam)
++{
++	unsigned int t, j, b, p;
++
++	/* VPU channels 1 and 2: required before the ISP start */
++	isp_wr(cam, VPU_CTRL, VPU_CTRL_BASE | VPU_CTRL_CHN(1) | VPU_CTRL_CHN(2));
++	fh_cam_vpu_aux_channel(cam, 1);
++	isp_wr(cam, VPU_CTRL, VPU_CTRL_BASE | VPU_CTRL_CHN(2));
++	fh_cam_vpu_aux_channel(cam, 2);
++	isp_wr(cam, VPU_CTRL, VPU_CTRL_BASE);
++
++	isp_wr(cam, ISP_INT_ENABLE, 0);
++	fh_cam_wr_list(cam, fh_cam_pic_size, ARRAY_SIZE(fh_cam_pic_size));
++
++	isp_wr(cam, ISP_INPUT, ISP_INPUT_RGGB_FLIP);
++	isp_wr(cam, ISP_BLC_0, pack16(ISP_BLC_LEVEL, ISP_BLC_LEVEL));
++	isp_wr(cam, ISP_BLC_1, pack16(ISP_BLC_LEVEL, ISP_BLC_LEVEL));
++
++	/* Linear tone curves: three of 12 bit, one of 10 bit, 160 entries */
++	for (t = 0; t < 4; t++) {
++		u32 max = t < 3 ? 4095 : 1023;
++
++		for (j = 0; j < 80; j++)
++			isp_wr(cam, ISP_TONE(t) + 4 * j,
++			       pack16(DIV_ROUND_CLOSEST(2 * j * max, 159),
++				      DIV_ROUND_CLOSEST((2 * j + 1) * max, 159)));
++	}
++
++	/* White balance: the last gains (AWB or manual) */
++	isp_wr(cam, ISP_WB_BG, pack16(cam->wb_b, WB_ONE));
++	isp_wr(cam, ISP_WB_GR, pack16(WB_ONE, cam->wb_r));
++
++	isp_wr(cam, ISP_DRC_CTRL, 0x0d);
++	isp_wr(cam, ISP_SAT, cam->sat);
++
++	for (j = 0; j < 128; j++)
++		isp_wr(cam, ISP_GAMMA + 4 * j,
++		       pack16(fh_cam_gamma[2 * j], fh_cam_gamma[2 * j + 1]));
++	isp_wr(cam, ISP_GAMMA_CTRL, 0x00010007);
++
++	isp_wr(cam, ISP_CONTRAST, 0x40);
++	isp_wr(cam, ISP_YC_CTRL, ISP_YC_CHROMA_ON);
++
++	/* VPU scaler: identity filter (centre tap 1.0) in every phase */
++	for (b = 0; b < 4; b++)
++		for (p = 0; p < 64; p++) {
++			isp_wr(cam, VPU_COEF_BANK(b) + 8 * p, 0x100 << 10);
++			isp_wr(cam, VPU_COEF_BANK(b) + 8 * p + 4, 0);
++		}
++}
++
++static void fh_cam_isp_start(struct fh_cam *cam, dma_addr_t y)
++{
++	u32 vstep = DIV_ROUND_CLOSEST(FH_IN_H * FH_SCALE_ONE, FH_OUT_H);
++	unsigned int c;
++
++	isp_wr(cam, ISP_PKG_ENABLE, 4);
++	isp_wr(cam, ISP_PIPE_CTRL, 5);
++	isp_wr(cam, ISP_PKG_ENABLE, 5);
++
++	for (c = 0; c < 3; c++) {
++		isp_wr(cam, VPU_VI_SIZE(c), pack16(FH_IN_W - 1, FH_IN_W - 1));
++		isp_wr(cam, VPU_VI_SIZE2(c), pack16(FH_IN_H - 1, FH_IN_H / 2 - 1));
++	}
++
++	/* Channel 0: 1920x1088 NV12 */
++	isp_wr(cam, VPU_CHN_STEP(0), FH_SCALE_ONE);
++	isp_wr(cam, VPU_CHN_STEP(0) + 4, FH_SCALE_ONE);
++	isp_wr(cam, VPU_CHN_STEP(0) + 8, vstep);
++	isp_wr(cam, VPU_CHN_STEP(0) + 12, vstep);
++	isp_wr(cam, VPU_CHN_W(0), FH_OUT_W - 1);
++	isp_wr(cam, VPU_CHN_H(0), FH_OUT_H - 1);
++	isp_wr(cam, VPU_CHN_OFFSET(0), 0);
++	isp_wr(cam, VPU_CHN_SIZE(0), SIZE(FH_OUT_W, FH_OUT_H));
++	isp_wr(cam, VPU_CHN_SCALE(0), 0);
++	isp_wr(cam, VPU_CHN_SCALE(0) + 4, 0);
++	isp_wr(cam, VPU_CHN_SCALE(0) + 8, 0);
++	isp_wr(cam, VPU_CTRL, VPU_CTRL_BASE);
++	isp_wr(cam, VPU_CHN0_MODE, ((FH_IN_H - 1) << 12) | (FH_IN_H - 1));
++	isp_wr(cam, VPU_CHN0_STRIDE, pack16(FH_OUT_W, FH_OUT_W));
++	isp_wr(cam, VPU_CHN0_Y, y);
++	isp_wr(cam, VPU_CHN0_C, y + FH_Y_SIZE);
++	isp_wr(cam, VPU_CTRL, VPU_CTRL_BASE | VPU_CTRL_CHN(0));
++
++	/* Mean and SAD outputs: a scratch buffer, the data is not used */
++	isp_wr(cam, VPU_MEAN_Y_ADDR, cam->aux_dma);
++	isp_wr(cam, VPU_MEAN_Y_CFG, 0x00780000);
++	isp_wr(cam, VPU_MEAN_C_ADDR, cam->aux_dma + 0x2000);
++	isp_wr(cam, VPU_MEAN_C_CFG, 0x00f00000);
++	isp_wr(cam, VPU_SAD_ADDR, cam->aux_dma + 0x8000);
++	isp_wr(cam, VPU_SAD_CFG, 0x000000f0);
++
++	isp_wr(cam, ISP_INT_STATUS, 0xffffffff);
++	isp_wr(cam, ISP_INT_ENABLE, ISP_INT_ISPF_END);
++}
++
++static void fh_cam_isp_stop(struct fh_cam *cam)
++{
++	isp_wr(cam, ISP_INT_ENABLE, 0);
++	isp_wr(cam, ISP_PKG_ENABLE, 0);
++	isp_wr(cam, ISP_PIPE_CTRL, 4);
++	/* VPU channels, CPY and BGM off; the DMA drains within 3 frames */
++	isp_wr(cam, VPU_CTRL, isp_rd(cam, VPU_CTRL) & ~(GENMASK(22, 20) | GENMASK(18, 17)));
++	msleep(100);
++	isp_wr(cam, ISP_INT_STATUS, 0xffffffff);
++}
++
++/* ------------------------------------------------------------------------
++ * JPEG encoder
++ */
++
++static inline void jpeg_wr(struct fh_cam *cam, u32 off, u32 val)
++{
++	writel(val, cam->jpeg + off);
++}
++
++static inline u32 jpeg_rd(struct fh_cam *cam, u32 off)
++{
++	return readl(cam->jpeg + off);
++}
++
++/* Canonical Huffman codes of one table (T.81 Annex C) */
++static void jpeg_codes(const u8 *bits, const u8 *vals, u16 *code, u8 *len)
++{
++	unsigned int l, i, k = 0;
++	u16 c = 0;
++
++	for (l = 1; l <= 16; l++) {
++		for (i = 0; i < bits[l - 1]; i++, k++) {
++			code[vals[k]] = c++;
++			len[vals[k]] = l;
++		}
++		c <<= 1;
++	}
++}
++
++/* Encoder entry: low 8 bits of the code (the hardware adds leading 1s), length - 1 */
++static u8 *jpeg_entry(u8 *p, u16 code, u8 len)
++{
++	*p++ = code & 0xff;
++	*p++ = len - 1;
++	return p;
++}
++
++static u8 *jpeg_ac_table(u8 *p, const u8 *bits, const u8 *vals)
++{
++	u16 code[256] = {};
++	u8 len[256] = {};
++	unsigned int run, size, i;
++
++	jpeg_codes(bits, vals, code, len);
++	for (run = 0; run < 16; run++)
++		for (size = 1; size <= 10; size++)
++			p = jpeg_entry(p, code[run << 4 | size], len[run << 4 | size]);
++	p = jpeg_entry(p, code[0x00], len[0x00]);	/* EOB */
++	p = jpeg_entry(p, code[0xf0], len[0xf0]);	/* ZRL */
++	for (i = 0; i < 6; i++)
++		p = jpeg_entry(p, 0xff, 16);
++	for (i = 0; i < 8; i++)				/* RST0..7 */
++		p = jpeg_entry(p, 0xd0 + i, 16);
++
++	return p;
++}
++
++static u8 *jpeg_dc_table(u8 *p, const u8 *bits)
++{
++	static const u8 vals[12] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
++	u16 code[256] = {};
++	u8 len[256] = {};
++	unsigned int i;
++
++	jpeg_codes(bits, vals, code, len);
++	for (i = 0; i < 12; i++)
++		p = jpeg_entry(p, code[i], len[i]);
++	memset(p, 0, 8);
++
++	return p + 8;
++}
++
++static void fh_jpeg_build_tables(struct fh_cam *cam)
++{
++	static const u8 dc_vals[12] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
++	u8 *p = cam->huff;
++
++	p = jpeg_ac_table(p, jpeg_ac_l_bits, jpeg_ac_l_vals);
++	p = jpeg_ac_table(p, jpeg_ac_c_bits, jpeg_ac_c_vals);
++	p = jpeg_dc_table(p, jpeg_dc_l_bits);
++	jpeg_dc_table(p, jpeg_dc_c_bits);
++
++	p = cam->dht;
++	memcpy(p, jpeg_dc_l_bits, 16);
++	memcpy(p + 16, dc_vals, 12);
++	memcpy(p + 28, jpeg_ac_l_bits, 16);
++	memcpy(p + 44, jpeg_ac_l_vals, 162);
++	memcpy(p + 206, jpeg_dc_c_bits, 16);
++	memcpy(p + 222, dc_vals, 12);
++	memcpy(p + 234, jpeg_ac_c_bits, 16);
++	memcpy(p + 250, jpeg_ac_c_vals, 162);
++}
++
++/* IJG quality 1..100 -> scale of the Annex K tables, zigzag order */
++static void fh_jpeg_set_quality(struct fh_cam *cam, unsigned int quality)
++{
++	unsigned int scale = quality < 50 ? 5000 / quality : 200 - 2 * quality;
++	unsigned int i;
++
++	for (i = 0; i < 64; i++) {
++		cam->qtab[i] = clamp((jpeg_q_l[jpeg_zigzag[i]] * scale + 50) / 100, 1U, 255U);
++		cam->qtab[64 + i] = clamp((jpeg_q_c[jpeg_zigzag[i]] * scale + 50) / 100, 1U, 255U);
++	}
++}
++
++static void jpeg_wr_bytes(struct fh_cam *cam, u32 off, const u8 *b, unsigned int n)
++{
++	unsigned int i;
++
++	for (i = 0; i < n; i += 4)
++		jpeg_wr(cam, off + i, b[i] | b[i + 1] << 8 |
++			(i + 2 < n ? b[i + 2] << 16 : 0) |
++			(i + 3 < n ? b[i + 3] << 24 : 0));
++}
++
++static int fh_jpeg_reset(struct fh_cam *cam)
++{
++	u32 val;
++
++	jpeg_wr(cam, JPEG_RESET, 15);
++	return readl_poll_timeout(cam->jpeg + JPEG_RESET_BUSY, val, !val, 10, 10000);
++}
++
++static int fh_jpeg_hw_init(struct fh_cam *cam)
++{
++	int ret = fh_jpeg_reset(cam);
++
++	if (ret) {
++		dev_err(cam->dev, "JPEG reset timed out\n");
++		return ret;
++	}
++	jpeg_wr_bytes(cam, JPEG_HUFF, cam->huff, sizeof(cam->huff));
++	jpeg_wr_bytes(cam, JPEG_DHT, cam->dht, sizeof(cam->dht));
++	jpeg_wr(cam, JPEG_STATUS, jpeg_rd(cam, JPEG_STATUS));
++
++	return 0;
++}
++
++/* Called with irqlock held: encode an NV12 frame into buf */
++static void fh_jpeg_encode(struct fh_cam *cam, dma_addr_t src, struct fh_cam_buffer *buf)
++{
++	dma_addr_t dst = vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf, 0);
++	u32 size = min_t(u32, vb2_plane_size(&buf->vb.vb2_buf, 0) & ~15, 0xfffff0);
++
++	cam->jpeg_job = buf;
++	jpeg_wr_bytes(cam, JPEG_QTAB, cam->qtab, sizeof(cam->qtab));
++	jpeg_wr(cam, JPEG_CTRL, jpeg_rd(cam, JPEG_CTRL) | BIT(31));
++	jpeg_wr(cam, JPEG_SIZE_A, FH_OUT_H << 16 | BIT(8) | 1 << 4 | 2);
++	jpeg_wr(cam, JPEG_SIZE_B, FH_OUT_W << 16);
++	jpeg_wr(cam, JPEG_SRC_Y, src);
++	jpeg_wr(cam, JPEG_SRC_C, src + FH_Y_SIZE);
++	jpeg_wr(cam, JPEG_MB, (FH_OUT_H / 16 - 1) << 16 | (FH_OUT_W / 16 - 1));
++	jpeg_wr(cam, JPEG_STRIDE, 0);
++	jpeg_wr(cam, JPEG_DST_SIZE0, size);
++	jpeg_wr(cam, JPEG_DST_SIZE1, size);
++	jpeg_wr(cam, JPEG_INPUT, FH_OUT_W << 16 | JPEG_INPUT_NV12 | 1);
++	jpeg_wr(cam, JPEG_BURST, FH_OUT_W % 64 ? 3 : 7);
++	jpeg_wr(cam, JPEG_MODE, 3);
++	jpeg_wr(cam, JPEG_DST0, dst);
++	jpeg_wr(cam, JPEG_DST1, dst);
++	jpeg_wr(cam, JPEG_STATUS, jpeg_rd(cam, JPEG_STATUS));
++	jpeg_wr(cam, JPEG_START, 0x80000001);
++}
++
++/* Called with irqlock held: hand out the finished JPEG, if the encoder is done */
++static bool fh_jpeg_complete(struct fh_cam *cam)
++{
++	struct fh_cam_buffer *buf = cam->jpeg_job;
++	u32 status = jpeg_rd(cam, JPEG_STATUS);
++	enum vb2_buffer_state state = VB2_BUF_STATE_DONE;
++	u32 len;
++
++	if (!buf || !(status & JPEG_STATUS_DONE))
++		return false;
++	jpeg_wr(cam, JPEG_STATUS, status);
++
++	len = jpeg_rd(cam, JPEG_LENGTH);
++	if (!len || len > vb2_plane_size(&buf->vb.vb2_buf, 0)) {
++		dev_warn_ratelimited(cam->dev, "JPEG length %u, buffer %lu\n", len,
++				     vb2_plane_size(&buf->vb.vb2_buf, 0));
++		state = VB2_BUF_STATE_ERROR;
++		len = 0;
++	}
++	vb2_set_plane_payload(&buf->vb.vb2_buf, 0, len);
++	vb2_buffer_done(&buf->vb.vb2_buf, state);
++	cam->jpeg_job = NULL;
++
++	return true;
++}
++
++static irqreturn_t fh_jpeg_irq(int irq, void *data)
++{
++	struct fh_cam *cam = data;
++	irqreturn_t ret = IRQ_NONE;
++
++	spin_lock(&cam->irqlock);
++	if (fh_jpeg_complete(cam)) {
++		cam->jpeg_irq_seen = true;
++		ret = IRQ_HANDLED;
++	} else if (jpeg_rd(cam, JPEG_STATUS)) {
++		jpeg_wr(cam, JPEG_STATUS, jpeg_rd(cam, JPEG_STATUS));
++		ret = IRQ_HANDLED;
++	}
++	spin_unlock(&cam->irqlock);
++
++	return ret;
++}
++
++/* ------------------------------------------------------------------------
++ * Auto exposure
++ */
++
++/*
++ * Statistics of a frame on a coarse grid (the buffer is uncached: few
++ * reads): mean luma, and mean Cb/Cr of the near-gray points.
++ */
++static bool fh_cam_sample(const u8 *y, struct fh_cam_stats *st)
++{
++	unsigned int gx, gy, ysum = 0, mid = 0;
++	int cbsum = 0, crsum = 0, cbmid = 0, crmid = 0;
++
++	if (!y)
++		return false;
++
++	st->gray = 0;
++	for (gy = 0; gy < AE_GRID_H; gy++) {
++		unsigned int row = (2 * gy + 1) * FH_IN_H / (2 * AE_GRID_H);
++		const u8 *yl = y + row * FH_OUT_W;
++		const u8 *cl = y + FH_Y_SIZE + (row / 2) * FH_OUT_W;
++
++		for (gx = 0; gx < AE_GRID_W; gx++) {
++			unsigned int col = (2 * gx + 1) * FH_OUT_W / (2 * AE_GRID_W);
++			unsigned int luma = yl[col];
++			int cb, cr;
++
++			ysum += luma;
++			if (luma < AWB_Y_MIN || luma > AWB_Y_MAX)
++				continue;
++			cb = cl[col & ~1] - 128;
++			cr = cl[(col & ~1) + 1] - 128;
++			cbmid += cb;
++			crmid += cr;
++			mid++;
++			if (abs(cb) + abs(cr) >= AWB_C_MAX)
++				continue;
++			cbsum += cb;
++			crsum += cr;
++			st->gray++;
++		}
++	}
++
++	st->y = ysum / (AE_GRID_W * AE_GRID_H);
++	/* Far off (e.g. a new light source): no point looks gray yet */
++	if (st->gray < AWB_MIN_POINTS) {
++		st->gray = mid;
++		cbsum = cbmid;
++		crsum = crmid;
++	}
++	st->cb_q4 = st->gray ? cbsum * 16 / (int)st->gray : 0;
++	st->cr_q4 = st->gray ? crsum * 16 / (int)st->gray : 0;
++
++	return true;
++}
++
++/* One gray-world step on a gain: chroma too high -> gain down */
++static u32 fh_cam_awb_step(u32 gain, int c_q4)
++{
++	int step;
++
++	if (abs(c_q4) <= AWB_DEADBAND_Q4)
++		return gain;
++	step = clamp(c_q4 / 2, -AWB_STEP_MAX_Q8, AWB_STEP_MAX_Q8);
++
++	return clamp_t(u32, gain * (256 - step) / 256, WB_MIN, WB_MAX);
++}
++
++/* Called with irqlock held, from the interrupt handler */
++static void fh_cam_awb(struct fh_cam *cam, const struct fh_cam_stats *st)
++{
++	if (st->gray < AWB_MIN_POINTS)
++		return;
++
++	cam->wb_r = fh_cam_awb_step(cam->wb_r, st->cr_q4);
++	cam->wb_b = fh_cam_awb_step(cam->wb_b, st->cb_q4);
++	isp_wr(cam, ISP_WB_BG, pack16(cam->wb_b, WB_ONE));
++	isp_wr(cam, ISP_WB_GR, pack16(WB_ONE, cam->wb_r));
++}
++
++static void fh_cam_ae_work(struct work_struct *work)
++{
++	struct fh_cam *cam = container_of(work, struct fh_cam, ae_work);
++	struct v4l2_ctrl *exp = cam->sensor_exposure, *gain = cam->sensor_gain;
++	unsigned int mean, target = clamp(ae_target, 16U, 240U);
++	unsigned long flags;
++	u32 lines, again, total, f;
++	bool on;
++
++	spin_lock_irqsave(&cam->irqlock, flags);
++	on = cam->ae_on && cam->streaming;
++	mean = cam->ae_mean;
++	spin_unlock_irqrestore(&cam->irqlock, flags);
++
++	if (!on || !exp || !gain)
++		return;
++	if (abs((int)mean - (int)target) <= AE_DEADBAND)
++		return;
++
++	/*
++	 * Damped step: the square root of the brightness error (the output
++	 * passes the gamma curve, so luma is not linear in exposure anyway),
++	 * at most a factor of 2 per step. f in Q8.
++	 */
++	f = int_sqrt((target << 16) / max(mean, 1U));
++	f = clamp(f, 128U, 512U);
++
++	lines = v4l2_ctrl_g_ctrl(exp);
++	again = v4l2_ctrl_g_ctrl(gain);
++	total = max(1U, (u32)(((u64)lines * again * f) >> 8));	/* lines x gain */
++
++	/* Exposure time first, gain only above the longest time */
++	lines = clamp_t(u32, total / AE_GAIN_ONE, exp->minimum, exp->maximum);
++	if (lines >= AE_FLICKER_LINES)
++		lines = rounddown(lines, AE_FLICKER_LINES);
++	again = clamp_t(u32, DIV_ROUND_CLOSEST(total, lines), AE_GAIN_ONE,
++			min_t(s64, AE_GAIN_MAX, gain->maximum));
++
++	v4l2_ctrl_s_ctrl(exp, lines);
++	v4l2_ctrl_s_ctrl(gain, again);
++
++	dev_dbg(cam->dev, "AE: mean %u target %u -> exposure %u gain %u\n",
++		mean, target, lines, again);
++}
++
++static int fh_cam_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct fh_cam *cam = container_of(ctrl->handler, struct fh_cam, ctrls);
++	unsigned long flags;
++
++	if (ctrl->id != V4L2_CID_AUTO_WHITE_BALANCE)
++		return -EINVAL;
++
++	spin_lock_irqsave(&cam->irqlock, flags);
++	cam->red->val = cam->wb_r;
++	cam->blue->val = cam->wb_b;
++	spin_unlock_irqrestore(&cam->irqlock, flags);
++
++	return 0;
++}
++
++static int fh_cam_s_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct fh_cam *cam = container_of(ctrl->handler, struct fh_cam, ctrls);
++	unsigned long flags;
++
++	spin_lock_irqsave(&cam->irqlock, flags);
++	switch (ctrl->id) {
++	case V4L2_CID_EXPOSURE_AUTO:
++		cam->ae_on = ctrl->val == V4L2_EXPOSURE_AUTO;
++		break;
++	case V4L2_CID_SATURATION:	/* 0x1ff and above give false colour */
++		cam->sat = 2 * ctrl->val;
++		if (cam->streaming)
++			isp_wr(cam, ISP_SAT, cam->sat);
++		break;
++	case V4L2_CID_JPEG_COMPRESSION_QUALITY:	/* used from the next frame */
++		fh_jpeg_set_quality(cam, ctrl->val);
++		break;
++	case V4L2_CID_AUTO_WHITE_BALANCE:	/* cluster master */
++		cam->awb_on = ctrl->val;
++		if (!cam->awb_on) {
++			cam->wb_r = cam->red->val;
++			cam->wb_b = cam->blue->val;
++			if (cam->streaming) {
++				isp_wr(cam, ISP_WB_BG, pack16(cam->wb_b, WB_ONE));
++				isp_wr(cam, ISP_WB_GR, pack16(WB_ONE, cam->wb_r));
++			}
++		}
++		break;
++	}
++	spin_unlock_irqrestore(&cam->irqlock, flags);
++
++	return 0;
++}
++
++static const struct v4l2_ctrl_ops fh_cam_ctrl_ops = {
++	.g_volatile_ctrl = fh_cam_g_volatile_ctrl,
++	.s_ctrl = fh_cam_s_ctrl,
++};
++
++/* ------------------------------------------------------------------------
++ * Interrupt
++ */
++
++static irqreturn_t fh_cam_irq(int irq, void *data)
++{
++	struct fh_cam *cam = data;
++	struct fh_cam_buffer *next;
++	struct fh_cam_stats st;
++	u32 status;
++
++	status = isp_rd(cam, ISP_INT_STATUS);
++	if (!status)
++		return IRQ_NONE;
++	isp_wr(cam, ISP_INT_STATUS, status);
++
++	if (!(status & ISP_INT_ISPF_END))
++		return IRQ_HANDLED;
++
++	spin_lock(&cam->irqlock);
++
++	if (cam->streaming && cam->pixfmt == V4L2_PIX_FMT_MJPEG) {
++		unsigned int done = cam->nv_cur;
++
++		/* The next frame goes to the other internal buffer */
++		cam->nv_cur ^= 1;
++		isp_wr(cam, VPU_CHN0_Y, cam->nv_dma[cam->nv_cur]);
++		isp_wr(cam, VPU_CHN0_C, cam->nv_dma[cam->nv_cur] + FH_Y_SIZE);
++
++		if ((cam->ae_on || cam->awb_on) && !(cam->sequence % AE_PERIOD) &&
++		    fh_cam_sample(cam->nv_cpu[done], &st)) {
++			if (cam->awb_on)
++				fh_cam_awb(cam, &st);
++			if (cam->ae_on) {
++				cam->ae_mean = st.y;
++				schedule_work(&cam->ae_work);
++			}
++		}
++
++		/* Fallback if the JPEG interrupt does not arrive */
++		if (cam->jpeg_job && fh_jpeg_complete(cam) && !cam->jpeg_irq_seen)
++			dev_warn_once(cam->dev, "no JPEG interrupt, completing at frame end\n");
++
++		next = list_first_entry_or_null(&cam->pending,
++						struct fh_cam_buffer, list);
++		if (next && !cam->jpeg_job) {
++			list_del(&next->list);
++			next->vb.vb2_buf.timestamp = ktime_get_ns();
++			next->vb.sequence = cam->sequence;
++			next->vb.field = V4L2_FIELD_NONE;
++			fh_jpeg_encode(cam, cam->nv_dma[done], next);
++		}
++		/* else: frame dropped */
++		cam->sequence++;
++	} else if (cam->streaming && cam->cur) {
++		next = list_first_entry_or_null(&cam->pending,
++						struct fh_cam_buffer, list);
++		if (next) {
++			dma_addr_t y = vb2_dma_contig_plane_dma_addr(&next->vb.vb2_buf, 0);
++
++			list_del(&next->list);
++			isp_wr(cam, VPU_CHN0_Y, y);
++			isp_wr(cam, VPU_CHN0_C, y + FH_Y_SIZE);
++
++			if ((cam->ae_on || cam->awb_on) &&
++			    !(cam->sequence % AE_PERIOD) &&
++			    cam->cur->vb.vb2_buf.memory == VB2_MEMORY_MMAP &&
++			    fh_cam_sample(vb2_plane_vaddr(&cam->cur->vb.vb2_buf, 0), &st)) {
++				if (cam->awb_on)
++					fh_cam_awb(cam, &st);
++				if (cam->ae_on) {
++					cam->ae_mean = st.y;
++					schedule_work(&cam->ae_work);
++				}
++			}
++
++			cam->cur->vb.vb2_buf.timestamp = ktime_get_ns();
++			cam->cur->vb.sequence = cam->sequence;
++			cam->cur->vb.field = V4L2_FIELD_NONE;
++			vb2_buffer_done(&cam->cur->vb.vb2_buf, VB2_BUF_STATE_DONE);
++			cam->cur = next;
++		}
++		/* else: the next frame overwrites cur, this one is dropped */
++		cam->sequence++;
++	}
++
++	spin_unlock(&cam->irqlock);
++
++	return IRQ_HANDLED;
++}
++
++/* ------------------------------------------------------------------------
++ * videobuf2
++ */
++
++static unsigned int fh_cam_sizeimage(struct fh_cam *cam)
++{
++	return cam->pixfmt == V4L2_PIX_FMT_MJPEG ? JPEG_BUF_SIZE : FH_FRAME_SIZE;
++}
++
++static int fh_cam_queue_setup(struct vb2_queue *q, unsigned int *nbuffers,
++			      unsigned int *nplanes, unsigned int sizes[],
++			      struct device *alloc_devs[])
++{
++	struct fh_cam *cam = vb2_get_drv_priv(q);
++
++	if (*nplanes)
++		return sizes[0] < fh_cam_sizeimage(cam) ? -EINVAL : 0;
++
++	*nplanes = 1;
++	sizes[0] = fh_cam_sizeimage(cam);
++
++	return 0;
++}
++
++static int fh_cam_buf_prepare(struct vb2_buffer *vb)
++{
++	struct fh_cam *cam = vb2_get_drv_priv(vb->vb2_queue);
++
++	if (vb2_plane_size(vb, 0) < fh_cam_sizeimage(cam))
++		return -EINVAL;
++
++	/* MJPEG: the payload is set when the encoder is done */
++	vb2_set_plane_payload(vb, 0, cam->pixfmt == V4L2_PIX_FMT_MJPEG ? 0 :
++			      FH_FRAME_SIZE);
++
++	return 0;
++}
++
++static void fh_cam_buf_queue(struct vb2_buffer *vb)
++{
++	struct fh_cam *cam = vb2_get_drv_priv(vb->vb2_queue);
++	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
++	struct fh_cam_buffer *buf = container_of(vbuf, struct fh_cam_buffer, vb);
++	unsigned long flags;
++
++	spin_lock_irqsave(&cam->irqlock, flags);
++	list_add_tail(&buf->list, &cam->pending);
++	spin_unlock_irqrestore(&cam->irqlock, flags);
++}
++
++static void fh_cam_return_buffers(struct fh_cam *cam,
++				  enum vb2_buffer_state state)
++{
++	struct fh_cam_buffer *buf, *tmp;
++	unsigned long flags;
++
++	spin_lock_irqsave(&cam->irqlock, flags);
++	if (cam->cur) {
++		vb2_buffer_done(&cam->cur->vb.vb2_buf, state);
++		cam->cur = NULL;
++	}
++	if (cam->jpeg_job) {
++		vb2_buffer_done(&cam->jpeg_job->vb.vb2_buf, state);
++		cam->jpeg_job = NULL;
++	}
++	list_for_each_entry_safe(buf, tmp, &cam->pending, list) {
++		list_del(&buf->list);
++		vb2_buffer_done(&buf->vb.vb2_buf, state);
++	}
++	spin_unlock_irqrestore(&cam->irqlock, flags);
++}
++
++static void fh_cam_free_nv(struct fh_cam *cam)
++{
++	unsigned int i;
++
++	for (i = 0; i < 2; i++) {
++		if (cam->nv_cpu[i])
++			dma_free_coherent(cam->dev, FH_FRAME_SIZE, cam->nv_cpu[i],
++					  cam->nv_dma[i]);
++		cam->nv_cpu[i] = NULL;
++	}
++}
++
++static int fh_cam_start_streaming(struct vb2_queue *q, unsigned int count)
++{
++	struct fh_cam *cam = vb2_get_drv_priv(q);
++	bool mjpeg = cam->pixfmt == V4L2_PIX_FMT_MJPEG;
++	struct fh_cam_buffer *first = NULL;
++	unsigned long flags;
++	dma_addr_t start;
++	unsigned int i;
++	int ret;
++
++	if (!cam->sensor) {
++		ret = -ENODEV;
++		goto err_return;
++	}
++
++	if (mjpeg) {
++		for (i = 0; i < 2; i++) {
++			cam->nv_cpu[i] = dma_alloc_coherent(cam->dev, FH_FRAME_SIZE,
++							    &cam->nv_dma[i], GFP_KERNEL);
++			if (!cam->nv_cpu[i]) {
++				ret = -ENOMEM;
++				goto err_free;
++			}
++		}
++		start = cam->nv_dma[0];
++	}
++
++	spin_lock_irqsave(&cam->irqlock, flags);
++	if (!mjpeg) {
++		first = list_first_entry(&cam->pending, struct fh_cam_buffer, list);
++		list_del(&first->list);
++		start = vb2_dma_contig_plane_dma_addr(&first->vb.vb2_buf, 0);
++	}
++	cam->cur = first;
++	cam->nv_cur = 0;
++	cam->jpeg_job = NULL;
++	cam->sequence = 0;
++	spin_unlock_irqrestore(&cam->irqlock, flags);
++
++	ret = fh_cam_clocks_on(cam);
++	ret = ret ?: fh_cam_csi_init(cam);
++	if (!ret && mjpeg)
++		ret = fh_jpeg_hw_init(cam);
++	if (ret)
++		goto err_free;
++
++	/* As in the bring-up: sensor streaming first, then the ISP */
++	ret = v4l2_subdev_enable_streams(cam->sensor, cam->sensor_pad, BIT(0));
++	if (ret) {
++		dev_err(cam->dev, "cannot start the sensor: %d\n", ret);
++		goto err_return;
++	}
++
++	ret = fh_cam_isp_reset(cam);
++	if (ret)
++		goto err_sensor;
++
++	fh_cam_isp_setup(cam);
++
++	spin_lock_irqsave(&cam->irqlock, flags);
++	cam->streaming = true;
++	spin_unlock_irqrestore(&cam->irqlock, flags);
++
++	if (mjpeg)
++		enable_irq(cam->jpeg_irq);
++	enable_irq(cam->irq);
++	fh_cam_isp_start(cam, start);
++
++	return 0;
++
++err_sensor:
++	v4l2_subdev_disable_streams(cam->sensor, cam->sensor_pad, BIT(0));
++err_free:
++	fh_cam_free_nv(cam);
++err_return:
++	fh_cam_return_buffers(cam, VB2_BUF_STATE_QUEUED);
++	return ret;
++}
++
++static void fh_cam_stop_streaming(struct vb2_queue *q)
++{
++	struct fh_cam *cam = vb2_get_drv_priv(q);
++	unsigned long flags;
++
++	spin_lock_irqsave(&cam->irqlock, flags);
++	cam->streaming = false;
++	spin_unlock_irqrestore(&cam->irqlock, flags);
++
++	fh_cam_isp_stop(cam);
++	disable_irq(cam->irq);
++	if (cam->pixfmt == V4L2_PIX_FMT_MJPEG) {
++		/* The encoder needs well under a frame time; it is done by now */
++		disable_irq(cam->jpeg_irq);
++		spin_lock_irqsave(&cam->irqlock, flags);
++		fh_jpeg_complete(cam);
++		spin_unlock_irqrestore(&cam->irqlock, flags);
++	}
++	cancel_work_sync(&cam->ae_work);
++	v4l2_subdev_disable_streams(cam->sensor, cam->sensor_pad, BIT(0));
++
++	fh_cam_return_buffers(cam, VB2_BUF_STATE_ERROR);
++	fh_cam_free_nv(cam);
++}
++
++static const struct vb2_ops fh_cam_vb2_ops = {
++	.queue_setup = fh_cam_queue_setup,
++	.buf_prepare = fh_cam_buf_prepare,
++	.buf_queue = fh_cam_buf_queue,
++	.start_streaming = fh_cam_start_streaming,
++	.stop_streaming = fh_cam_stop_streaming,
++};
++
++/* ------------------------------------------------------------------------
++ * V4L2 ioctls: one fixed format
++ */
++
++static void fh_cam_fill_fmt(struct v4l2_pix_format *pix, u32 pixfmt)
++{
++	pix->width = FH_OUT_W;
++	pix->height = FH_OUT_H;
++	pix->field = V4L2_FIELD_NONE;
++	pix->ycbcr_enc = V4L2_YCBCR_ENC_601;
++	pix->quantization = V4L2_QUANTIZATION_FULL_RANGE;
++	pix->xfer_func = V4L2_XFER_FUNC_DEFAULT;
++	if (pixfmt == V4L2_PIX_FMT_MJPEG) {
++		pix->pixelformat = V4L2_PIX_FMT_MJPEG;
++		pix->bytesperline = 0;
++		pix->sizeimage = JPEG_BUF_SIZE;
++		pix->colorspace = V4L2_COLORSPACE_JPEG;
++	} else {
++		pix->pixelformat = V4L2_PIX_FMT_NV12;
++		pix->bytesperline = FH_OUT_W;
++		pix->sizeimage = FH_FRAME_SIZE;
++		pix->colorspace = V4L2_COLORSPACE_SRGB;
++	}
++}
++
++static int fh_cam_querycap(struct file *file, void *priv,
++			   struct v4l2_capability *cap)
++{
++	strscpy(cap->driver, DRV_NAME, sizeof(cap->driver));
++	strscpy(cap->card, "FH8626V200 camera", sizeof(cap->card));
++
++	return 0;
++}
++
++static int fh_cam_enum_fmt(struct file *file, void *priv,
++			   struct v4l2_fmtdesc *f)
++{
++	static const u32 fmts[] = { V4L2_PIX_FMT_NV12, V4L2_PIX_FMT_MJPEG };
++
++	if (f->index >= ARRAY_SIZE(fmts) ||
++	    (f->mbus_code && f->mbus_code != MEDIA_BUS_FMT_SBGGR10_1X10))
++		return -EINVAL;
++
++	f->pixelformat = fmts[f->index];
++	if (f->pixelformat == V4L2_PIX_FMT_MJPEG)
++		f->flags = V4L2_FMT_FLAG_COMPRESSED;
++
++	return 0;
++}
++
++static int fh_cam_g_fmt(struct file *file, void *priv, struct v4l2_format *f)
++{
++	struct fh_cam *cam = video_drvdata(file);
++
++	fh_cam_fill_fmt(&f->fmt.pix, cam->pixfmt);
++
++	return 0;
++}
++
++static int fh_cam_try_fmt(struct file *file, void *priv, struct v4l2_format *f)
++{
++	fh_cam_fill_fmt(&f->fmt.pix, f->fmt.pix.pixelformat);
++
++	return 0;
++}
++
++static int fh_cam_s_fmt(struct file *file, void *priv, struct v4l2_format *f)
++{
++	struct fh_cam *cam = video_drvdata(file);
++
++	if (vb2_is_busy(&cam->queue))
++		return -EBUSY;
++
++	fh_cam_fill_fmt(&f->fmt.pix, f->fmt.pix.pixelformat);
++	cam->pixfmt = f->fmt.pix.pixelformat;
++
++	return 0;
++}
++
++static int fh_cam_enum_framesizes(struct file *file, void *priv,
++				  struct v4l2_frmsizeenum *fsize)
++{
++	if (fsize->index || (fsize->pixel_format != V4L2_PIX_FMT_NV12 &&
++			     fsize->pixel_format != V4L2_PIX_FMT_MJPEG))
++		return -EINVAL;
++
++	fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
++	fsize->discrete.width = FH_OUT_W;
++	fsize->discrete.height = FH_OUT_H;
++
++	return 0;
++}
++
++static const struct v4l2_ioctl_ops fh_cam_ioctl_ops = {
++	.vidioc_querycap = fh_cam_querycap,
++	.vidioc_enum_fmt_vid_cap = fh_cam_enum_fmt,
++	.vidioc_g_fmt_vid_cap = fh_cam_g_fmt,
++	.vidioc_try_fmt_vid_cap = fh_cam_try_fmt,
++	.vidioc_s_fmt_vid_cap = fh_cam_s_fmt,
++	.vidioc_enum_framesizes = fh_cam_enum_framesizes,
++	.vidioc_reqbufs = vb2_ioctl_reqbufs,
++	.vidioc_create_bufs = vb2_ioctl_create_bufs,
++	.vidioc_prepare_buf = vb2_ioctl_prepare_buf,
++	.vidioc_querybuf = vb2_ioctl_querybuf,
++	.vidioc_qbuf = vb2_ioctl_qbuf,
++	.vidioc_dqbuf = vb2_ioctl_dqbuf,
++	.vidioc_expbuf = vb2_ioctl_expbuf,
++	.vidioc_streamon = vb2_ioctl_streamon,
++	.vidioc_streamoff = vb2_ioctl_streamoff,
++};
++
++static const struct v4l2_file_operations fh_cam_fops = {
++	.owner = THIS_MODULE,
++	.open = v4l2_fh_open,
++	.release = vb2_fop_release,
++	.unlocked_ioctl = video_ioctl2,
++	.mmap = vb2_fop_mmap,
++	.poll = vb2_fop_poll,
++};
++
++/* ------------------------------------------------------------------------
++ * Sensor binding
++ */
++
++static int fh_cam_notify_bound(struct v4l2_async_notifier *notifier,
++			       struct v4l2_subdev *sd,
++			       struct v4l2_async_connection *asc)
++{
++	struct fh_cam *cam = container_of(notifier, struct fh_cam, notifier);
++	int pad;
++
++	pad = media_entity_get_fwnode_pad(&sd->entity, asc->match.fwnode,
++					  MEDIA_PAD_FL_SOURCE);
++	if (pad < 0)
++		return pad;
++
++	cam->sensor = sd;
++	cam->sensor_pad = pad;
++	cam->sensor_exposure = v4l2_ctrl_find(sd->ctrl_handler, V4L2_CID_EXPOSURE);
++	cam->sensor_gain = v4l2_ctrl_find(sd->ctrl_handler, V4L2_CID_ANALOGUE_GAIN);
++	if (!cam->sensor_exposure || !cam->sensor_gain)
++		dev_warn(cam->dev, "sensor without exposure/gain controls: no AE\n");
++
++	return media_create_pad_link(&sd->entity, pad, &cam->vdev.entity, 0,
++				     MEDIA_LNK_FL_ENABLED | MEDIA_LNK_FL_IMMUTABLE);
++}
++
++static int fh_cam_notify_complete(struct v4l2_async_notifier *notifier)
++{
++	struct fh_cam *cam = container_of(notifier, struct fh_cam, notifier);
++
++	return v4l2_device_register_subdev_nodes(&cam->v4l2_dev);
++}
++
++static const struct v4l2_async_notifier_operations fh_cam_notify_ops = {
++	.bound = fh_cam_notify_bound,
++	.complete = fh_cam_notify_complete,
++};
++
++static int fh_cam_parse_dt(struct fh_cam *cam)
++{
++	struct v4l2_fwnode_endpoint vep = { .bus_type = V4L2_MBUS_CSI2_DPHY };
++	struct v4l2_async_connection *asc;
++	struct fwnode_handle *ep;
++	int ret;
++
++	ep = fwnode_graph_get_endpoint_by_id(dev_fwnode(cam->dev), 0, 0, 0);
++	if (!ep)
++		return dev_err_probe(cam->dev, -ENODEV, "no sensor endpoint\n");
++
++	ret = v4l2_fwnode_endpoint_parse(ep, &vep);
++	if (ret) {
++		fwnode_handle_put(ep);
++		return dev_err_probe(cam->dev, ret, "cannot parse the endpoint\n");
++	}
++	if (vep.bus.mipi_csi2.num_data_lanes != 2) {
++		fwnode_handle_put(ep);
++		return dev_err_probe(cam->dev, -EINVAL, "only 2 data lanes supported\n");
++	}
++
++	asc = v4l2_async_nf_add_fwnode_remote(&cam->notifier, ep,
++					      struct v4l2_async_connection);
++	fwnode_handle_put(ep);
++
++	return PTR_ERR_OR_ZERO(asc);
++}
++
++/* ------------------------------------------------------------------------
++ * Probe
++ */
++
++static int fh_cam_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct video_device *vdev;
++	struct vb2_queue *q;
++	struct fh_cam *cam;
++	int ret;
++
++	cam = devm_kzalloc(dev, sizeof(*cam), GFP_KERNEL);
++	if (!cam)
++		return -ENOMEM;
++
++	cam->dev = dev;
++	mutex_init(&cam->lock);
++	spin_lock_init(&cam->irqlock);
++	INIT_LIST_HEAD(&cam->pending);
++	platform_set_drvdata(pdev, cam);
++
++	cam->isp = devm_platform_ioremap_resource_byname(pdev, "isp");
++	if (IS_ERR(cam->isp))
++		return PTR_ERR(cam->isp);
++	cam->wrap = devm_platform_ioremap_resource_byname(pdev, "wrap");
++	if (IS_ERR(cam->wrap))
++		return PTR_ERR(cam->wrap);
++	cam->csi = devm_platform_ioremap_resource_byname(pdev, "csi");
++	if (IS_ERR(cam->csi))
++		return PTR_ERR(cam->csi);
++	cam->dphy = devm_platform_ioremap_resource_byname(pdev, "dphy");
++	if (IS_ERR(cam->dphy))
++		return PTR_ERR(cam->dphy);
++	cam->jpeg = devm_platform_ioremap_resource_byname(pdev, "jpeg");
++	if (IS_ERR(cam->jpeg))
++		return PTR_ERR(cam->jpeg);
++	cam->pixfmt = V4L2_PIX_FMT_NV12;
++	fh_jpeg_build_tables(cam);
++	fh_jpeg_set_quality(cam, JPEG_QUALITY_DEFAULT);
++
++	cam->pmu = syscon_regmap_lookup_by_phandle(dev->of_node, "fullhan,pmu");
++	if (IS_ERR(cam->pmu))
++		return dev_err_probe(dev, PTR_ERR(cam->pmu), "no PMU syscon\n");
++
++	cam->irq = platform_get_irq_byname(pdev, "isp");
++	if (cam->irq < 0)
++		return cam->irq;
++	cam->jpeg_irq = platform_get_irq_byname(pdev, "jpeg");
++	if (cam->jpeg_irq < 0)
++		return cam->jpeg_irq;
++
++	ret = of_reserved_mem_device_init(dev);
++	if (ret)
++		return dev_err_probe(dev, ret, "no camera memory region\n");
++
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		goto err_mem;
++
++	/*
++	 * Not from the camera pool: it allocates power-of-two blocks, and a
++	 * small allocation would cost one of the four 4 MiB frame slots.
++	 */
++	cam->aux_page = dma_alloc_pages(dev, AUX_BUF_SIZE, &cam->aux_dma,
++					DMA_FROM_DEVICE, GFP_KERNEL);
++	if (!cam->aux_page) {
++		ret = -ENOMEM;
++		goto err_mem;
++	}
++
++	/* Enabled while streaming: the ISP registers need the ISP clocks */
++	ret = devm_request_irq(dev, cam->irq, fh_cam_irq, IRQF_NO_AUTOEN,
++			       dev_name(dev), cam);
++	if (ret)
++		goto err_aux;
++	ret = devm_request_irq(dev, cam->jpeg_irq, fh_jpeg_irq, IRQF_NO_AUTOEN,
++			       "fh8626-jpeg", cam);
++	if (ret)
++		goto err_aux;
++
++	/* Media device, V4L2 device */
++	cam->mdev.dev = dev;
++	strscpy(cam->mdev.model, "FH8626V200 camera", sizeof(cam->mdev.model));
++	media_device_init(&cam->mdev);
++	cam->v4l2_dev.mdev = &cam->mdev;
++
++	ret = v4l2_device_register(dev, &cam->v4l2_dev);
++	if (ret)
++		goto err_mdev;
++
++	INIT_WORK(&cam->ae_work, fh_cam_ae_work);
++	cam->ae_on = true;
++	cam->awb_on = true;
++	cam->wb_r = WB_R_DEFAULT;
++	cam->wb_b = WB_B_DEFAULT;
++	cam->sat = 0x100;
++	v4l2_ctrl_handler_init(&cam->ctrls, 6);
++	v4l2_ctrl_new_std(&cam->ctrls, &fh_cam_ctrl_ops, V4L2_CID_SATURATION,
++			  0, 255, 1, 128);
++	v4l2_ctrl_new_std(&cam->ctrls, &fh_cam_ctrl_ops,
++			  V4L2_CID_JPEG_COMPRESSION_QUALITY, 1, 100, 1,
++			  JPEG_QUALITY_DEFAULT);
++	v4l2_ctrl_new_std_menu(&cam->ctrls, &fh_cam_ctrl_ops, V4L2_CID_EXPOSURE_AUTO,
++			       V4L2_EXPOSURE_MANUAL,
++			       ~(BIT(V4L2_EXPOSURE_AUTO) | BIT(V4L2_EXPOSURE_MANUAL)),
++			       V4L2_EXPOSURE_AUTO);
++	cam->awb = v4l2_ctrl_new_std(&cam->ctrls, &fh_cam_ctrl_ops,
++				     V4L2_CID_AUTO_WHITE_BALANCE, 0, 1, 1, 1);
++	cam->red = v4l2_ctrl_new_std(&cam->ctrls, &fh_cam_ctrl_ops,
++				     V4L2_CID_RED_BALANCE, WB_MIN, WB_MAX, 1,
++				     WB_R_DEFAULT);
++	cam->blue = v4l2_ctrl_new_std(&cam->ctrls, &fh_cam_ctrl_ops,
++				      V4L2_CID_BLUE_BALANCE, WB_MIN, WB_MAX, 1,
++				      WB_B_DEFAULT);
++	ret = cam->ctrls.error;
++	if (ret)
++		goto err_ctrls;
++	v4l2_ctrl_auto_cluster(3, &cam->awb, 0, true);
++
++	/* Queue */
++	q = &cam->queue;
++	q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++	q->io_modes = VB2_MMAP | VB2_DMABUF;
++	q->drv_priv = cam;
++	q->buf_struct_size = sizeof(struct fh_cam_buffer);
++	q->ops = &fh_cam_vb2_ops;
++	q->mem_ops = &vb2_dma_contig_memops;
++	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
++	q->min_queued_buffers = 1;
++	q->lock = &cam->lock;
++	q->dev = dev;
++	ret = vb2_queue_init(q);
++	if (ret)
++		goto err_ctrls;
++
++	/* Video node */
++	vdev = &cam->vdev;
++	strscpy(vdev->name, DRV_NAME, sizeof(vdev->name));
++	vdev->v4l2_dev = &cam->v4l2_dev;
++	vdev->fops = &fh_cam_fops;
++	vdev->ioctl_ops = &fh_cam_ioctl_ops;
++	vdev->ctrl_handler = &cam->ctrls;
++	vdev->release = video_device_release_empty;
++	vdev->lock = &cam->lock;
++	vdev->queue = q;
++	vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING |
++			    V4L2_CAP_IO_MC;
++	video_set_drvdata(vdev, cam);
++
++	cam->pad.flags = MEDIA_PAD_FL_SINK;
++	ret = media_entity_pads_init(&vdev->entity, 1, &cam->pad);
++	if (ret)
++		goto err_ctrls;
++
++	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
++	if (ret)
++		goto err_entity;
++
++	/* Sensor */
++	v4l2_async_nf_init(&cam->notifier, &cam->v4l2_dev);
++	cam->notifier.ops = &fh_cam_notify_ops;
++	ret = fh_cam_parse_dt(cam);
++	if (ret)
++		goto err_nf;
++	ret = v4l2_async_nf_register(&cam->notifier);
++	if (ret)
++		goto err_nf;
++
++	ret = media_device_register(&cam->mdev);
++	if (ret)
++		goto err_nf_unreg;
++
++	dev_info(dev, "%ux%u NV12 on %s\n", FH_OUT_W, FH_OUT_H,
++		 video_device_node_name(vdev));
++
++	return 0;
++
++err_nf_unreg:
++	v4l2_async_nf_unregister(&cam->notifier);
++err_nf:
++	v4l2_async_nf_cleanup(&cam->notifier);
++	video_unregister_device(vdev);
++err_entity:
++	media_entity_cleanup(&vdev->entity);
++err_ctrls:
++	v4l2_ctrl_handler_free(&cam->ctrls);
++	v4l2_device_unregister(&cam->v4l2_dev);
++err_mdev:
++	media_device_cleanup(&cam->mdev);
++err_aux:
++	dma_free_pages(dev, AUX_BUF_SIZE, cam->aux_page, cam->aux_dma,
++		       DMA_FROM_DEVICE);
++err_mem:
++	of_reserved_mem_device_release(dev);
++	return ret;
++}
++
++static void fh_cam_remove(struct platform_device *pdev)
++{
++	struct fh_cam *cam = platform_get_drvdata(pdev);
++
++	media_device_unregister(&cam->mdev);
++	v4l2_async_nf_unregister(&cam->notifier);
++	v4l2_async_nf_cleanup(&cam->notifier);
++	video_unregister_device(&cam->vdev);
++	media_entity_cleanup(&cam->vdev.entity);
++	v4l2_ctrl_handler_free(&cam->ctrls);
++	v4l2_device_unregister(&cam->v4l2_dev);
++	media_device_cleanup(&cam->mdev);
++	dma_free_pages(cam->dev, AUX_BUF_SIZE, cam->aux_page, cam->aux_dma,
++		       DMA_FROM_DEVICE);
++	of_reserved_mem_device_release(cam->dev);
++}
++
++static const struct of_device_id fh_cam_of_match[] = {
++	{ .compatible = "fullhan,fh8626v200-camera" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, fh_cam_of_match);
++
++static struct platform_driver fh_cam_driver = {
++	.probe = fh_cam_probe,
++	.remove = fh_cam_remove,
++	.driver = {
++		.name = DRV_NAME,
++		.of_match_table = fh_cam_of_match,
++	},
++};
++module_platform_driver(fh_cam_driver);
++
++MODULE_DESCRIPTION("Fullhan FH8626V200 camera (CSI-2, ISP, VPU channel 0)");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/media/platform/fullhan/fh8626-isp-bringup.c b/drivers/media/platform/fullhan/fh8626-isp-bringup.c
+new file mode 100644
+index 0000000..807f1eb
+--- /dev/null
++++ b/drivers/media/platform/fullhan/fh8626-isp-bringup.c
+@@ -0,0 +1,455 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Fullhan FH8626V200 ISP bring-up helper
++ *
++ * Not a capture driver. The ISP is configured from user space (cam-probe,
++ * /dev/mem); this driver only does what cannot be done from there: service
++ * the ISP interrupt in real time. The stock firmware switches the ISPP
++ * statistics buffer and re-arms the raw dump in every frame; without that
++ * the pipeline stops after the first frame with the statistics events
++ * (status bits 2/3 and 16/17) pending.
++ *
++ * The handler acknowledges the status (+0x04, write 1 to clear), counts each
++ * status bit, switches the statistics buffer on bit 3 and rewrites the dump
++ * address on bit 17. On our board bits 3, 16, 17 and 26 come once per frame.
++ * Status bits as named by the stock handler's trace strings: 17 ISPF start,
++ * 16 ISPP start, 1 ISPF end, 0 ISPP end, 3 pipe conflict, 2 ISPP overflow.
++ *
++ * VPU kickoff: like the stock vpu_kickoff_by_isp, on ISPF start the driver
++ * writes the addresses of one VPU channel and switches the channel enable
++ * (+0x30 bit 20 + channel) off and on again; the channel appears to start
++ * on that edge. Storm protection: bits that stay set after the
++ * acknowledgement for many interrupts in a row, or that come with more than
++ * STORM_RATE interrupts per second, are masked (bit 2 re-triggers immediately
++ * after each acknowledgement on our board).
++ *
++ * Registers (offsets from the ISP base, see docs/CAM.md of the firmware
++ * project): +0x04 interrupt status, +0x08 interrupt enable (write-only),
++ * +0x124 raw dump address, +0x524/+0x4ec statistics buffer.
++ *
++ * sysfs (all values hex):
++ *   mask       interrupt enable mask written to +0x08 (0 = off)
++ *   dump_addr  raw dump address rewritten on frame interrupts (0 = off)
++ *   stat_addr  base of two statistics buffers (base, base + 0x8000; 0 = off)
++ *   status     current +0x04
++ *   counts     per status bit: number of interrupts with that bit set;
++ *              writing anything resets the counters
++ *   vpu_chn    VPU channel kicked off on ISPF start (-1 = none), decimal;
++ *              reading also shows the number of kickoffs
++ *   vpu_y, vpu_c  Y and C address written for that channel
++ *
++ * Register access only happens through the sysfs files and the interrupt,
++ * never at probe time: the ISP clocks are switched on by cam-probe.
++ */
++
++#include <linux/bits.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/jiffies.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/spinlock.h>
++#include <linux/sysfs.h>
++
++#define ISP_INT_STATUS		0x004
++#define ISP_INT_ENABLE		0x008
++#define ISP_DUMP_ADDR		0x124
++#define ISP_STAT_ADDR		0x524
++#define ISP_STAT_ADDR2		0x4ec
++#define VPU_CTRL		0x030
++#define VPU_CHN_ADDR(c)		(0x1350 + 0xc * (c))	/* Y; C at +4 */
++#define VPU_CHN_EN(c)		BIT(20 + (c))
++
++#define ISP_INT_FRAME		BIT(17)	/* ISPF start */
++#define ISP_INT_ISPP_STAT	BIT(3)
++
++#define STAT_BUF_SIZE		0x8000	/* 0x60c8 used per buffer */
++#define STAT_ADDR2_OFFSET	0x2030	/* as in ispp_set_stat_addr */
++#define STORM_LIMIT		1000
++#define STORM_RATE		20000	/* interrupts per second */
++
++struct fh_isp {
++	struct device *dev;
++	void __iomem *base;
++	spinlock_t lock;	/* protects everything below */
++	u32 mask;
++	u32 dump_addr;
++	u32 stat_addr;
++	unsigned int stat_idx;
++	int vpu_chn;		/* -1: no VPU kickoff */
++	u32 vpu_y, vpu_c;
++	u32 kickoffs;
++	u32 stuck;		/* bits still set after the last acknowledgement */
++	unsigned int stuck_count;
++	u32 counts[32];
++	u32 irqs;
++	unsigned long window;	/* jiffies: start of the rate window */
++	unsigned int window_irqs;
++};
++
++static void fh_isp_set_stat_addr(struct fh_isp *isp)
++{
++	u32 addr = isp->stat_addr + isp->stat_idx * STAT_BUF_SIZE;
++
++	writel(addr, isp->base + ISP_STAT_ADDR);
++	writel(addr + STAT_ADDR2_OFFSET, isp->base + ISP_STAT_ADDR2);
++}
++
++static irqreturn_t fh_isp_irq(int irq, void *data)
++{
++	struct fh_isp *isp = data;
++	u32 status, left;
++	int bit;
++
++	spin_lock(&isp->lock);
++
++	status = readl(isp->base + ISP_INT_STATUS);
++	if (!status) {
++		spin_unlock(&isp->lock);
++		return IRQ_NONE;
++	}
++	writel(status, isp->base + ISP_INT_STATUS);
++
++	isp->irqs++;
++	for (bit = 0; bit < 32; bit++)
++		if (status & BIT(bit))
++			isp->counts[bit]++;
++
++	if ((status & ISP_INT_ISPP_STAT) && isp->stat_addr) {
++		isp->stat_idx ^= 1;
++		fh_isp_set_stat_addr(isp);
++	}
++	if ((status & ISP_INT_FRAME) && isp->dump_addr)
++		writel(isp->dump_addr, isp->base + ISP_DUMP_ADDR);
++	if ((status & ISP_INT_FRAME) && isp->vpu_chn >= 0) {
++		u32 ctrl = readl(isp->base + VPU_CTRL);
++
++		writel(isp->vpu_y, isp->base + VPU_CHN_ADDR(isp->vpu_chn));
++		writel(isp->vpu_c, isp->base + VPU_CHN_ADDR(isp->vpu_chn) + 4);
++		writel(ctrl & ~VPU_CHN_EN(isp->vpu_chn), isp->base + VPU_CTRL);
++		writel(ctrl | VPU_CHN_EN(isp->vpu_chn), isp->base + VPU_CTRL);
++		isp->kickoffs++;
++	}
++
++	/* Storm protection 1: too many interrupts per second */
++	if (time_after(jiffies, isp->window + HZ)) {
++		isp->window = jiffies;
++		isp->window_irqs = 0;
++	}
++	if (++isp->window_irqs > STORM_RATE && (status & isp->mask)) {
++		isp->mask &= ~status;
++		writel(isp->mask, isp->base + ISP_INT_ENABLE);
++		dev_warn(isp->dev, "interrupt storm with status %#x, masked; mask now %#x\n",
++			 status, isp->mask);
++		isp->window_irqs = 0;
++	}
++
++	/* Storm protection 2: mask bits that the acknowledgement does not clear */
++	left = readl(isp->base + ISP_INT_STATUS) & isp->mask;
++	if (left && left == isp->stuck) {
++		if (++isp->stuck_count >= STORM_LIMIT) {
++			isp->mask &= ~left;
++			writel(isp->mask, isp->base + ISP_INT_ENABLE);
++			dev_warn(isp->dev, "status %#x stuck, masked; mask now %#x\n",
++				 left, isp->mask);
++			isp->stuck_count = 0;
++		}
++	} else {
++		isp->stuck = left;
++		isp->stuck_count = 0;
++	}
++
++	spin_unlock(&isp->lock);
++
++	return IRQ_HANDLED;
++}
++
++static ssize_t fh_isp_show_u32(struct device *dev, char *buf, u32 *val)
++{
++	struct fh_isp *isp = dev_get_drvdata(dev);
++	unsigned long flags;
++	u32 v;
++
++	spin_lock_irqsave(&isp->lock, flags);
++	v = *val;
++	spin_unlock_irqrestore(&isp->lock, flags);
++
++	return sysfs_emit(buf, "%#x\n", v);
++}
++
++static ssize_t fh_isp_store_u32(struct device *dev, const char *buf,
++				size_t count, u32 *val)
++{
++	struct fh_isp *isp = dev_get_drvdata(dev);
++	unsigned long flags;
++	u32 v;
++	int ret;
++
++	ret = kstrtou32(buf, 16, &v);
++	if (ret)
++		return ret;
++
++	spin_lock_irqsave(&isp->lock, flags);
++	*val = v;
++	spin_unlock_irqrestore(&isp->lock, flags);
++
++	return count;
++}
++
++static ssize_t vpu_chn_show(struct device *dev, struct device_attribute *attr,
++			    char *buf)
++{
++	struct fh_isp *isp = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%d kickoffs %u\n", isp->vpu_chn, isp->kickoffs);
++}
++
++static ssize_t vpu_chn_store(struct device *dev, struct device_attribute *attr,
++			     const char *buf, size_t count)
++{
++	struct fh_isp *isp = dev_get_drvdata(dev);
++	unsigned long flags;
++	int v, ret;
++
++	ret = kstrtoint(buf, 0, &v);
++	if (ret)
++		return ret;
++	if (v < -1 || v > 2)
++		return -EINVAL;
++
++	spin_lock_irqsave(&isp->lock, flags);
++	isp->vpu_chn = v;
++	isp->kickoffs = 0;
++	spin_unlock_irqrestore(&isp->lock, flags);
++
++	return count;
++}
++static DEVICE_ATTR_RW(vpu_chn);
++
++static ssize_t vpu_y_show(struct device *dev, struct device_attribute *attr,
++			  char *buf)
++{
++	struct fh_isp *isp = dev_get_drvdata(dev);
++
++	return fh_isp_show_u32(dev, buf, &isp->vpu_y);
++}
++
++static ssize_t vpu_y_store(struct device *dev, struct device_attribute *attr,
++			   const char *buf, size_t count)
++{
++	struct fh_isp *isp = dev_get_drvdata(dev);
++
++	return fh_isp_store_u32(dev, buf, count, &isp->vpu_y);
++}
++static DEVICE_ATTR_RW(vpu_y);
++
++static ssize_t vpu_c_show(struct device *dev, struct device_attribute *attr,
++			  char *buf)
++{
++	struct fh_isp *isp = dev_get_drvdata(dev);
++
++	return fh_isp_show_u32(dev, buf, &isp->vpu_c);
++}
++
++static ssize_t vpu_c_store(struct device *dev, struct device_attribute *attr,
++			   const char *buf, size_t count)
++{
++	struct fh_isp *isp = dev_get_drvdata(dev);
++
++	return fh_isp_store_u32(dev, buf, count, &isp->vpu_c);
++}
++static DEVICE_ATTR_RW(vpu_c);
++
++static ssize_t mask_show(struct device *dev, struct device_attribute *attr,
++			 char *buf)
++{
++	struct fh_isp *isp = dev_get_drvdata(dev);
++
++	return fh_isp_show_u32(dev, buf, &isp->mask);
++}
++
++static ssize_t mask_store(struct device *dev, struct device_attribute *attr,
++			  const char *buf, size_t count)
++{
++	struct fh_isp *isp = dev_get_drvdata(dev);
++	unsigned long flags;
++	u32 v;
++	int ret;
++
++	ret = kstrtou32(buf, 16, &v);
++	if (ret)
++		return ret;
++
++	spin_lock_irqsave(&isp->lock, flags);
++	isp->mask = v;
++	isp->stuck = 0;
++	isp->stuck_count = 0;
++	writel(v, isp->base + ISP_INT_ENABLE);
++	spin_unlock_irqrestore(&isp->lock, flags);
++
++	return count;
++}
++static DEVICE_ATTR_RW(mask);
++
++static ssize_t dump_addr_show(struct device *dev, struct device_attribute *attr,
++			      char *buf)
++{
++	struct fh_isp *isp = dev_get_drvdata(dev);
++
++	return fh_isp_show_u32(dev, buf, &isp->dump_addr);
++}
++
++static ssize_t dump_addr_store(struct device *dev,
++			       struct device_attribute *attr,
++			       const char *buf, size_t count)
++{
++	struct fh_isp *isp = dev_get_drvdata(dev);
++
++	return fh_isp_store_u32(dev, buf, count, &isp->dump_addr);
++}
++static DEVICE_ATTR_RW(dump_addr);
++
++static ssize_t stat_addr_show(struct device *dev, struct device_attribute *attr,
++			      char *buf)
++{
++	struct fh_isp *isp = dev_get_drvdata(dev);
++
++	return fh_isp_show_u32(dev, buf, &isp->stat_addr);
++}
++
++static ssize_t stat_addr_store(struct device *dev,
++			       struct device_attribute *attr,
++			       const char *buf, size_t count)
++{
++	struct fh_isp *isp = dev_get_drvdata(dev);
++	unsigned long flags;
++	u32 v;
++	int ret;
++
++	ret = kstrtou32(buf, 16, &v);
++	if (ret)
++		return ret;
++
++	spin_lock_irqsave(&isp->lock, flags);
++	isp->stat_addr = v;
++	isp->stat_idx = 0;
++	if (v)
++		fh_isp_set_stat_addr(isp);
++	spin_unlock_irqrestore(&isp->lock, flags);
++
++	return count;
++}
++static DEVICE_ATTR_RW(stat_addr);
++
++static ssize_t status_show(struct device *dev, struct device_attribute *attr,
++			   char *buf)
++{
++	struct fh_isp *isp = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%#x\n", readl(isp->base + ISP_INT_STATUS));
++}
++static DEVICE_ATTR_RO(status);
++
++static ssize_t counts_show(struct device *dev, struct device_attribute *attr,
++			   char *buf)
++{
++	struct fh_isp *isp = dev_get_drvdata(dev);
++	unsigned long flags;
++	u32 counts[32], irqs;
++	int bit, len;
++
++	spin_lock_irqsave(&isp->lock, flags);
++	memcpy(counts, isp->counts, sizeof(counts));
++	irqs = isp->irqs;
++	spin_unlock_irqrestore(&isp->lock, flags);
++
++	len = sysfs_emit(buf, "irqs %u\n", irqs);
++	for (bit = 0; bit < 32; bit++)
++		if (counts[bit])
++			len += sysfs_emit_at(buf, len, "bit %d: %u\n", bit,
++					     counts[bit]);
++
++	return len;
++}
++
++static ssize_t counts_store(struct device *dev, struct device_attribute *attr,
++			    const char *buf, size_t count)
++{
++	struct fh_isp *isp = dev_get_drvdata(dev);
++	unsigned long flags;
++
++	spin_lock_irqsave(&isp->lock, flags);
++	memset(isp->counts, 0, sizeof(isp->counts));
++	isp->irqs = 0;
++	spin_unlock_irqrestore(&isp->lock, flags);
++
++	return count;
++}
++static DEVICE_ATTR_RW(counts);
++
++static struct attribute *fh_isp_attrs[] = {
++	&dev_attr_mask.attr,
++	&dev_attr_dump_addr.attr,
++	&dev_attr_stat_addr.attr,
++	&dev_attr_status.attr,
++	&dev_attr_counts.attr,
++	&dev_attr_vpu_chn.attr,
++	&dev_attr_vpu_y.attr,
++	&dev_attr_vpu_c.attr,
++	NULL
++};
++ATTRIBUTE_GROUPS(fh_isp);
++
++static int fh_isp_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct fh_isp *isp;
++	int irq, ret;
++
++	isp = devm_kzalloc(dev, sizeof(*isp), GFP_KERNEL);
++	if (!isp)
++		return -ENOMEM;
++
++	isp->dev = dev;
++	isp->vpu_chn = -1;
++	spin_lock_init(&isp->lock);
++
++	isp->base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(isp->base))
++		return PTR_ERR(isp->base);
++
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0)
++		return irq;
++
++	platform_set_drvdata(pdev, isp);
++
++	ret = devm_request_irq(dev, irq, fh_isp_irq, 0, dev_name(dev), isp);
++	if (ret)
++		return dev_err_probe(dev, ret, "cannot request IRQ %d\n", irq);
++
++	dev_info(dev, "bring-up helper ready (IRQ %d)\n", irq);
++
++	return 0;
++}
++
++static const struct of_device_id fh_isp_of_match[] = {
++	{ .compatible = "fullhan,fh8626-isp-bringup" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, fh_isp_of_match);
++
++static struct platform_driver fh_isp_driver = {
++	.probe = fh_isp_probe,
++	.driver = {
++		.name = "fh8626-isp-bringup",
++		.of_match_table = fh_isp_of_match,
++		.dev_groups = fh_isp_groups,
++		.suppress_bind_attrs = true,
++	},
++};
++module_platform_driver(fh_isp_driver);
++
++MODULE_DESCRIPTION("Fullhan FH8626V200 ISP bring-up helper");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index b9c11f6..a3f46ac 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -644,6 +644,21 @@ config MCHP_LAN966X_PCI
+ 	    - lan966x-miim (MDIO_MSCC_MIIM)
+ 	    - lan966x-switch (LAN966X_SWITCH)
+ 
++config GPIO_STEPPER
++	tristate "Unipolar stepper motor on GPIOs"
++	depends on GPIOLIB && OF
++	help
++	  Drives a four-coil unipolar stepper motor from four GPIOs with an
++	  hrtimer, half- or full-stepped, with a speed ramp. Each motor is
++	  controlled through /sys/class/stepper/<label>/.
++
++config GPIO_IRCUT
++	tristate "Latching IR-cut filter on two GPIOs"
++	depends on GPIOLIB && OF
++	help
++	  Switches a latching camera IR-cut filter with a short pulse on one
++	  of two GPIOs; the mode is set through a "mode" attribute in sysfs.
++
+ source "drivers/misc/c2port/Kconfig"
+ source "drivers/misc/eeprom/Kconfig"
+ source "drivers/misc/cb710/Kconfig"
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index b32a259..c933338 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -75,3 +75,5 @@ obj-$(CONFIG_MCHP_LAN966X_PCI)	+= lan966x-pci.o
+ obj-y				+= keba/
+ obj-y				+= amd-sbi/
+ obj-$(CONFIG_MISC_RP1)		+= rp1/
++obj-$(CONFIG_GPIO_STEPPER)	+= gpio-stepper.o
++obj-$(CONFIG_GPIO_IRCUT)	+= gpio-ircut.o
+diff --git a/drivers/misc/gpio-ircut.c b/drivers/misc/gpio-ircut.c
+new file mode 100644
+index 0000000..8627ecc
+--- /dev/null
++++ b/drivers/misc/gpio-ircut.c
+@@ -0,0 +1,114 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Latching IR-cut filter driven through two GPIOs (an H-bridge input
++ * each): a short pulse on day-gpios moves the filter in front of the lens,
++ * a pulse on night-gpios moves it away. Both lines are low otherwise.
++ *
++ *   /sys/devices/platform/<node>/mode   rw  "day" or "night"
++ *
++ * The driver switches to day mode at probe so the state is known.
++ */
++
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/module.h>
++#include <linux/mod_devicetable.h>
++#include <linux/mutex.h>
++#include <linux/platform_device.h>
++#include <linux/property.h>
++#include <linux/sysfs.h>
++
++struct ircut {
++	struct gpio_desc *day, *night;
++	struct mutex lock;
++	u32 pulse_ms;
++	bool is_night;
++};
++
++static void ircut_set(struct ircut *ic, bool night)
++{
++	struct gpio_desc *g = night ? ic->night : ic->day;
++
++	gpiod_set_value_cansleep(g, 1);
++	msleep(ic->pulse_ms);
++	gpiod_set_value_cansleep(g, 0);
++	ic->is_night = night;
++}
++
++static ssize_t mode_show(struct device *dev, struct device_attribute *a, char *buf)
++{
++	struct ircut *ic = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%s\n", READ_ONCE(ic->is_night) ? "night" : "day");
++}
++
++static ssize_t mode_store(struct device *dev, struct device_attribute *a,
++			  const char *buf, size_t len)
++{
++	struct ircut *ic = dev_get_drvdata(dev);
++	bool night;
++
++	if (sysfs_streq(buf, "night"))
++		night = true;
++	else if (sysfs_streq(buf, "day"))
++		night = false;
++	else
++		return -EINVAL;
++	/* always pulse: the filter may have been moved by hand or at power-up */
++	mutex_lock(&ic->lock);
++	ircut_set(ic, night);
++	mutex_unlock(&ic->lock);
++	return len;
++}
++static DEVICE_ATTR_RW(mode);
++
++static struct attribute *ircut_attrs[] = {
++	&dev_attr_mode.attr,
++	NULL
++};
++ATTRIBUTE_GROUPS(ircut);
++
++static int ircut_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct ircut *ic;
++
++	ic = devm_kzalloc(dev, sizeof(*ic), GFP_KERNEL);
++	if (!ic)
++		return -ENOMEM;
++	mutex_init(&ic->lock);
++
++	ic->day = devm_gpiod_get(dev, "day", GPIOD_OUT_LOW);
++	if (IS_ERR(ic->day))
++		return dev_err_probe(dev, PTR_ERR(ic->day), "day-gpios\n");
++	ic->night = devm_gpiod_get(dev, "night", GPIOD_OUT_LOW);
++	if (IS_ERR(ic->night))
++		return dev_err_probe(dev, PTR_ERR(ic->night), "night-gpios\n");
++
++	ic->pulse_ms = 150;
++	device_property_read_u32(dev, "pulse-ms", &ic->pulse_ms);
++	ic->pulse_ms = clamp_t(u32, ic->pulse_ms, 10, 1000);
++
++	platform_set_drvdata(pdev, ic);
++	ircut_set(ic, false);
++	return 0;
++}
++
++static const struct of_device_id ircut_of_match[] = {
++	{ .compatible = "gpio-ircut" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, ircut_of_match);
++
++static struct platform_driver ircut_driver = {
++	.probe = ircut_probe,
++	.driver = {
++		.name = "gpio-ircut",
++		.of_match_table = ircut_of_match,
++		.dev_groups = ircut_groups,
++	},
++};
++module_platform_driver(ircut_driver);
++
++MODULE_DESCRIPTION("Latching IR-cut filter on two GPIOs");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/misc/gpio-stepper.c b/drivers/misc/gpio-stepper.c
+new file mode 100644
+index 0000000..66b1689
+--- /dev/null
++++ b/drivers/misc/gpio-stepper.c
+@@ -0,0 +1,452 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Unipolar stepper motor on four GPIOs (coil 1..4), half- or full-stepped
++ * from an hrtimer, with a linear speed ramp at start, stop and reversal.
++ *
++ * Each motor appears as /sys/class/stepper/<label>/:
++ *
++ *   target     rw  write N to move to N, +N/-N to move relative; clamped to
++ *                  0..max_steps. The move runs in the background.
++ *   position   rw  current position; writable only while idle (to restore
++ *                  a saved position without moving)
++ *   moving     ro  1 while the motor runs; poll()able, notified at the end
++ *   stop       wo  decelerate and stop as soon as possible
++ *   home       wo  run max_steps towards 0 against the end stop, then 0
++ *   speed      rw  top speed in half-steps per second
++ *   max_steps  rw  travel range in half-steps
++ *   mode       rw  "half" (8 phases) or "full" (two coils, 4 phases)
++ *
++ * Positions and speeds are always in half-steps; in full-step mode a timer
++ * tick moves two of them. The coils are switched off when the motor is idle.
++ */
++
++#include <linux/gpio/consumer.h>
++#include <linux/hrtimer.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/mod_devicetable.h>
++#include <linux/platform_device.h>
++#include <linux/property.h>
++#include <linux/spinlock.h>
++#include <linux/sysfs.h>
++
++#define STEPPER_COILS		4
++#define STEPPER_START_SPEED	200	/* half-steps/s, ramp start and end */
++#define STEPPER_RAMP		32	/* ramp length in ticks */
++#define STEPPER_MAX_SPEED	4000
++#define STEPPER_SETTLE_NS	(20 * NSEC_PER_MSEC)	/* hold after the last step */
++
++/* Half-step sequence, bit n = coil n + 1; odd phases have two coils on. */
++static const u8 stepper_phases[8] = { 0x1, 0x3, 0x2, 0x6, 0x4, 0xc, 0x8, 0x9 };
++
++struct stepper {
++	struct device *dev;
++	struct gpio_descs *coils;
++	struct hrtimer timer;
++	struct kernfs_node *moving_kn;
++	spinlock_t lock;
++
++	/* all below under lock */
++	int pos;
++	int target;
++	int dir;		/* direction of the running move, 0 = none */
++	int ramp;		/* speed level 0..STEPPER_RAMP */
++	bool running;
++	bool settling;
++	bool full;
++	bool invert;
++	u32 speed;
++	u32 max_steps;
++};
++
++static void stepper_out(struct stepper *st, unsigned long bits)
++{
++	gpiod_set_array_value(st->coils->ndescs, st->coils->desc,
++			      st->coils->info, &bits);
++}
++
++static unsigned int stepper_phase(struct stepper *st)
++{
++	unsigned int p = ((st->pos % 8) + 8) % 8;
++
++	return st->invert ? 7 - p : p;
++}
++
++static u64 stepper_period(struct stepper *st, int halfsteps)
++{
++	u32 v0 = min_t(u32, STEPPER_START_SPEED, st->speed);
++	u32 v = v0 + (st->speed - v0) * st->ramp / STEPPER_RAMP;
++
++	return div_u64((u64)halfsteps * NSEC_PER_SEC, v);
++}
++
++static enum hrtimer_restart stepper_tick(struct hrtimer *t)
++{
++	struct stepper *st = container_of(t, struct stepper, timer);
++	unsigned long flags;
++	int dist, want, rem, n;
++	u64 ns;
++
++	spin_lock_irqsave(&st->lock, flags);
++
++	if (st->settling) {
++		stepper_out(st, 0);
++		st->settling = false;
++		st->running = false;
++		spin_unlock_irqrestore(&st->lock, flags);
++		sysfs_notify_dirent(st->moving_kn);
++		return HRTIMER_NORESTART;
++	}
++
++	dist = st->target - st->pos;
++	want = dist > 0 ? 1 : dist < 0 ? -1 : 0;
++	if (!st->dir)
++		st->dir = want;
++
++	if (want == st->dir && want) {
++		/* accelerate, but keep the stopping distance <= what is left */
++		rem = abs(dist);
++		st->ramp = min3(st->ramp + 1, STEPPER_RAMP, rem - 1);
++	} else if (st->ramp > 0) {
++		/* stop or reversal requested: brake in the old direction */
++		rem = INT_MAX;
++		st->ramp--;
++	} else {
++		/* standing still at speed level 0: turn around or finish */
++		st->dir = want;
++		if (!want) {
++			st->settling = true;
++			ns = STEPPER_SETTLE_NS;
++		} else {
++			ns = stepper_period(st, 1);
++		}
++		goto restart;
++	}
++
++	/* full-step: move between the two-coil phases (odd half-steps) */
++	n = 1;
++	if (st->full && (stepper_phase(st) & 1) && rem >= 2)
++		n = 2;
++	st->pos += n * st->dir;
++	stepper_out(st, stepper_phases[stepper_phase(st)]);
++	ns = stepper_period(st, n);
++
++restart:
++	spin_unlock_irqrestore(&st->lock, flags);
++	hrtimer_forward_now(t, ns_to_ktime(ns));
++	return HRTIMER_RESTART;
++}
++
++/* Called with the lock held. */
++static void stepper_go(struct stepper *st, int target)
++{
++	st->target = target;
++	st->settling = false;
++	if (!st->running) {
++		st->running = true;
++		st->dir = 0;
++		st->ramp = 0;
++		hrtimer_start(&st->timer, 0, HRTIMER_MODE_REL);
++	}
++}
++
++static int stepper_parse(const char *buf, int *val, bool *rel)
++{
++	*rel = buf[0] == '+' || buf[0] == '-';
++	return kstrtoint(buf, 0, val);
++}
++
++static ssize_t target_show(struct device *dev, struct device_attribute *a, char *buf)
++{
++	struct stepper *st = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%d\n", READ_ONCE(st->target));
++}
++
++static ssize_t target_store(struct device *dev, struct device_attribute *a,
++			    const char *buf, size_t len)
++{
++	struct stepper *st = dev_get_drvdata(dev);
++	unsigned long flags;
++	bool rel;
++	int v, ret;
++
++	ret = stepper_parse(buf, &v, &rel);
++	if (ret)
++		return ret;
++	spin_lock_irqsave(&st->lock, flags);
++	if (rel)
++		v += st->target;
++	stepper_go(st, clamp_t(int, v, 0, st->max_steps));
++	spin_unlock_irqrestore(&st->lock, flags);
++	return len;
++}
++static DEVICE_ATTR_RW(target);
++
++static ssize_t position_show(struct device *dev, struct device_attribute *a, char *buf)
++{
++	struct stepper *st = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%d\n", READ_ONCE(st->pos));
++}
++
++static ssize_t position_store(struct device *dev, struct device_attribute *a,
++			      const char *buf, size_t len)
++{
++	struct stepper *st = dev_get_drvdata(dev);
++	unsigned long flags;
++	int v, ret;
++
++	ret = kstrtoint(buf, 0, &v);
++	if (ret)
++		return ret;
++	if (v < 0 || v > st->max_steps)
++		return -ERANGE;
++	spin_lock_irqsave(&st->lock, flags);
++	if (st->running) {
++		ret = -EBUSY;
++	} else {
++		st->pos = v;
++		st->target = v;
++	}
++	spin_unlock_irqrestore(&st->lock, flags);
++	return ret ?: len;
++}
++static DEVICE_ATTR_RW(position);
++
++static ssize_t moving_show(struct device *dev, struct device_attribute *a, char *buf)
++{
++	struct stepper *st = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%d\n", READ_ONCE(st->running));
++}
++static DEVICE_ATTR_RO(moving);
++
++static ssize_t stop_store(struct device *dev, struct device_attribute *a,
++			  const char *buf, size_t len)
++{
++	struct stepper *st = dev_get_drvdata(dev);
++	unsigned long flags;
++
++	spin_lock_irqsave(&st->lock, flags);
++	/* the target the ramp can reach without overshooting */
++	if (st->running)
++		st->target = clamp_t(int, st->pos + st->dir * st->ramp * (st->full ? 2 : 1),
++				     0, st->max_steps);
++	spin_unlock_irqrestore(&st->lock, flags);
++	return len;
++}
++static DEVICE_ATTR_WO(stop);
++
++static ssize_t home_store(struct device *dev, struct device_attribute *a,
++			  const char *buf, size_t len)
++{
++	struct stepper *st = dev_get_drvdata(dev);
++	unsigned long flags;
++
++	spin_lock_irqsave(&st->lock, flags);
++	if (st->running) {
++		spin_unlock_irqrestore(&st->lock, flags);
++		return -EBUSY;
++	}
++	st->pos = st->max_steps;
++	stepper_go(st, 0);
++	spin_unlock_irqrestore(&st->lock, flags);
++	return len;
++}
++static DEVICE_ATTR_WO(home);
++
++static ssize_t speed_show(struct device *dev, struct device_attribute *a, char *buf)
++{
++	struct stepper *st = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%u\n", READ_ONCE(st->speed));
++}
++
++static ssize_t speed_store(struct device *dev, struct device_attribute *a,
++			   const char *buf, size_t len)
++{
++	struct stepper *st = dev_get_drvdata(dev);
++	unsigned long flags;
++	u32 v;
++	int ret;
++
++	ret = kstrtou32(buf, 0, &v);
++	if (ret)
++		return ret;
++	if (!v || v > STEPPER_MAX_SPEED)
++		return -ERANGE;
++	spin_lock_irqsave(&st->lock, flags);
++	st->speed = v;
++	spin_unlock_irqrestore(&st->lock, flags);
++	return len;
++}
++static DEVICE_ATTR_RW(speed);
++
++static ssize_t max_steps_show(struct device *dev, struct device_attribute *a, char *buf)
++{
++	struct stepper *st = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%u\n", READ_ONCE(st->max_steps));
++}
++
++static ssize_t max_steps_store(struct device *dev, struct device_attribute *a,
++			       const char *buf, size_t len)
++{
++	struct stepper *st = dev_get_drvdata(dev);
++	unsigned long flags;
++	u32 v;
++	int ret;
++
++	ret = kstrtou32(buf, 0, &v);
++	if (ret)
++		return ret;
++	if (!v || v > INT_MAX / 2)
++		return -ERANGE;
++	spin_lock_irqsave(&st->lock, flags);
++	st->max_steps = v;
++	spin_unlock_irqrestore(&st->lock, flags);
++	return len;
++}
++static DEVICE_ATTR_RW(max_steps);
++
++static ssize_t mode_show(struct device *dev, struct device_attribute *a, char *buf)
++{
++	struct stepper *st = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%s\n", READ_ONCE(st->full) ? "full" : "half");
++}
++
++static ssize_t mode_store(struct device *dev, struct device_attribute *a,
++			  const char *buf, size_t len)
++{
++	struct stepper *st = dev_get_drvdata(dev);
++	unsigned long flags;
++	bool full;
++
++	if (sysfs_streq(buf, "full"))
++		full = true;
++	else if (sysfs_streq(buf, "half"))
++		full = false;
++	else
++		return -EINVAL;
++	spin_lock_irqsave(&st->lock, flags);
++	st->full = full;
++	spin_unlock_irqrestore(&st->lock, flags);
++	return len;
++}
++static DEVICE_ATTR_RW(mode);
++
++static struct attribute *stepper_attrs[] = {
++	&dev_attr_target.attr,
++	&dev_attr_position.attr,
++	&dev_attr_moving.attr,
++	&dev_attr_stop.attr,
++	&dev_attr_home.attr,
++	&dev_attr_speed.attr,
++	&dev_attr_max_steps.attr,
++	&dev_attr_mode.attr,
++	NULL
++};
++ATTRIBUTE_GROUPS(stepper);
++
++static const struct class stepper_class = {
++	.name = "stepper",
++	.dev_groups = stepper_groups,
++};
++
++static void stepper_cleanup(void *data)
++{
++	struct stepper *st = data;
++
++	hrtimer_cancel(&st->timer);
++	stepper_out(st, 0);
++	sysfs_put(st->moving_kn);
++	device_unregister(st->dev);
++}
++
++static int stepper_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct stepper *st;
++	const char *label;
++	int ret;
++
++	st = devm_kzalloc(dev, sizeof(*st), GFP_KERNEL);
++	if (!st)
++		return -ENOMEM;
++	spin_lock_init(&st->lock);
++	hrtimer_setup(&st->timer, stepper_tick, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++
++	st->coils = devm_gpiod_get_array(dev, "coil", GPIOD_OUT_LOW);
++	if (IS_ERR(st->coils))
++		return dev_err_probe(dev, PTR_ERR(st->coils), "coil-gpios\n");
++	if (st->coils->ndescs != STEPPER_COILS)
++		return dev_err_probe(dev, -EINVAL, "need %d coil-gpios\n", STEPPER_COILS);
++	for (int i = 0; i < STEPPER_COILS; i++)
++		if (gpiod_cansleep(st->coils->desc[i]))
++			return dev_err_probe(dev, -EINVAL, "coil GPIOs must not sleep\n");
++
++	st->speed = 500;
++	st->max_steps = 4096;
++	device_property_read_u32(dev, "steps-per-second", &st->speed);
++	device_property_read_u32(dev, "max-steps", &st->max_steps);
++	st->speed = clamp_t(u32, st->speed, 1, STEPPER_MAX_SPEED);
++	st->max_steps = clamp_t(u32, st->max_steps, 1, INT_MAX / 2);
++	st->invert = device_property_read_bool(dev, "invert-direction");
++	st->full = device_property_read_bool(dev, "full-step");
++	if (device_property_read_string(dev, "label", &label))
++		label = dev_name(dev);
++
++	st->dev = device_create(&stepper_class, dev, 0, st, "%s", label);
++	if (IS_ERR(st->dev))
++		return PTR_ERR(st->dev);
++	st->moving_kn = sysfs_get_dirent(st->dev->kobj.sd, "moving");
++	if (!st->moving_kn) {
++		device_unregister(st->dev);
++		return -ENODEV;
++	}
++	ret = devm_add_action_or_reset(dev, stepper_cleanup, st);
++	if (ret)
++		return ret;
++
++	dev_info(dev, "%s: %u half-steps, %u/s\n", label, st->max_steps, st->speed);
++	return 0;
++}
++
++static const struct of_device_id stepper_of_match[] = {
++	{ .compatible = "gpio-stepper" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, stepper_of_match);
++
++static struct platform_driver stepper_driver = {
++	.probe = stepper_probe,
++	.driver = {
++		.name = "gpio-stepper",
++		.of_match_table = stepper_of_match,
++	},
++};
++
++static int __init stepper_init(void)
++{
++	int ret = class_register(&stepper_class);
++
++	if (ret)
++		return ret;
++	ret = platform_driver_register(&stepper_driver);
++	if (ret)
++		class_unregister(&stepper_class);
++	return ret;
++}
++module_init(stepper_init);
++
++static void __exit stepper_exit(void)
++{
++	platform_driver_unregister(&stepper_driver);
++	class_unregister(&stepper_class);
++}
++module_exit(stepper_exit);
++
++MODULE_DESCRIPTION("Unipolar stepper motor on GPIOs");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/phy/Kconfig b/drivers/phy/Kconfig
+index 678dd04..0c6e2a5 100644
+--- a/drivers/phy/Kconfig
++++ b/drivers/phy/Kconfig
+@@ -131,4 +131,15 @@ source "drivers/phy/ti/Kconfig"
+ source "drivers/phy/intel/Kconfig"
+ source "drivers/phy/xilinx/Kconfig"
+ 
++config PHY_FH8626_USB
++	tristate "Fullhan FH8626 USB 2.0 PHY"
++	depends on OF
++	depends on ARCH_FH8626 || COMPILE_TEST
++	select GENERIC_PHY
++	select MFD_SYSCON
++	help
++	  Enable this to support the USB 2.0 PHY of the Fullhan FH8626V200
++	  SoC.  The PHY is released from reset through the PMU, which is
++	  accessed as a syscon.
++
+ endmenu
+diff --git a/drivers/phy/Makefile b/drivers/phy/Makefile
+index bfb27fb..9842bb1 100644
+--- a/drivers/phy/Makefile
++++ b/drivers/phy/Makefile
+@@ -42,3 +42,4 @@ obj-y					+= allwinner/	\
+ 					   tegra/	\
+ 					   ti/		\
+ 					   xilinx/
++obj-$(CONFIG_PHY_FH8626_USB)	+= phy-fh8626-usb.o
+diff --git a/drivers/phy/phy-fh8626-usb.c b/drivers/phy/phy-fh8626-usb.c
+new file mode 100644
+index 0000000..42c5643
+--- /dev/null
++++ b/drivers/phy/phy-fh8626-usb.c
+@@ -0,0 +1,173 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Fullhan FH8626V200 USB 2.0 PHY
++ *
++ * The DWC2 core on this SoC cannot finish its soft reset (GRSTCTL.CSFTRST
++ * never clears) until the on-chip UTMI PHY has been taken out of reset
++ * through the PMU.  This driver does that as the PHY's init step, so that
++ * the generic dwc2 platform driver (which calls phy_init() before the core
++ * reset) works unmodified.
++ *
++ * Register offsets, bit positions and order come from a static analysis of
++ * the stock firmware (kernel 4.9.129, helpers fh_pmu_usb_phy_rst,
++ * fh_pmu_usb_utmi_rst, fh_pmu_usb_resume, fh_pmu_usb_tune) and were
++ * confirmed on the board: with PMU 0x228 bit 10 cleared the soft reset
++ * completes.  The *meaning* of the individual bits is inferred from the
++ * helper names only.  No vendor code is used; this is an independent
++ * implementation of the observed register sequence.
++ *
++ * VBUS: the module on the port is not powered by the controller.  The
++ * stock kernel switches a GPIO named "usb_pwren" (GPIO47 on the camera
++ * board; platform data of the stock fh_usb device).  Here that is an
++ * optional "vbus" regulator which is enabled in power_on, i.e. after the
++ * PHY has been released and before the controller starts the port.
++ */
++
++#include <linux/bits.h>
++#include <linux/delay.h>
++#include <linux/mfd/syscon.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/phy/phy.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <linux/regulator/consumer.h>
++
++#define PMU_UTMI_RST		0x040	/* bit 1: UTMI reset, 0 = asserted */
++#define  UTMI_RST_N		BIT(1)
++
++#define PMU_USB_CTRL		0x210
++#define  USB_CTRL_PHY_RST	(BIT(0) | BIT(4))	/* 1 = asserted */
++#define  USB_CTRL_RESUME	BIT(24)
++
++#define PMU_USB_TUNE		0x218
++#define  USB_TUNE_VALUE		0x78203344
++
++#define PMU_USB_PHY_CTRL	0x228
++#define  USB_PHY_HOLD		BIT(10)	/* set at reset, stock clears it */
++
++#define FH8626_USB_PHY_SETTLE_MS	50
++#define FH8626_USB_UTMI_SETTLE_MS	20
++
++struct fh8626_usb_phy {
++	struct regmap *pmu;
++	struct regulator *vbus;	/* optional */
++};
++
++static int fh8626_usb_phy_init(struct phy *phy)
++{
++	struct fh8626_usb_phy *p = phy_get_drvdata(phy);
++	struct regmap *pmu = p->pmu;
++	int ret;
++
++	/* 1. PHY reset (fh_pmu_usb_phy_rst) */
++	ret = regmap_update_bits(pmu, PMU_USB_PHY_CTRL, USB_PHY_HOLD, 0);
++	if (ret)
++		return ret;
++	msleep(FH8626_USB_PHY_SETTLE_MS);
++
++	ret = regmap_update_bits(pmu, PMU_USB_CTRL, USB_CTRL_PHY_RST,
++				 USB_CTRL_PHY_RST);
++	if (ret)
++		return ret;
++	msleep(FH8626_USB_PHY_SETTLE_MS);
++
++	ret = regmap_update_bits(pmu, PMU_USB_CTRL, USB_CTRL_PHY_RST, 0);
++	if (ret)
++		return ret;
++
++	/* 2. UTMI reset pulse (fh_pmu_usb_utmi_rst) */
++	ret = regmap_update_bits(pmu, PMU_UTMI_RST, UTMI_RST_N, 0);
++	if (ret)
++		return ret;
++	msleep(FH8626_USB_PHY_SETTLE_MS);
++
++	ret = regmap_update_bits(pmu, PMU_UTMI_RST, UTMI_RST_N, UTMI_RST_N);
++	if (ret)
++		return ret;
++	msleep(FH8626_USB_UTMI_SETTLE_MS);
++
++	/* 3. resume (fh_pmu_usb_resume) */
++	ret = regmap_update_bits(pmu, PMU_USB_CTRL, USB_CTRL_RESUME,
++				 USB_CTRL_RESUME);
++	if (ret)
++		return ret;
++	msleep(FH8626_USB_PHY_SETTLE_MS);
++
++	/* 4. tuning value (fh_pmu_usb_tune) */
++	return regmap_write(pmu, PMU_USB_TUNE, USB_TUNE_VALUE);
++}
++
++static int fh8626_usb_phy_power_on(struct phy *phy)
++{
++	struct fh8626_usb_phy *p = phy_get_drvdata(phy);
++
++	return p->vbus ? regulator_enable(p->vbus) : 0;
++}
++
++static int fh8626_usb_phy_power_off(struct phy *phy)
++{
++	struct fh8626_usb_phy *p = phy_get_drvdata(phy);
++
++	return p->vbus ? regulator_disable(p->vbus) : 0;
++}
++
++static const struct phy_ops fh8626_usb_phy_ops = {
++	.init		= fh8626_usb_phy_init,
++	.power_on	= fh8626_usb_phy_power_on,
++	.power_off	= fh8626_usb_phy_power_off,
++	.owner	= THIS_MODULE,
++};
++
++static int fh8626_usb_phy_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct phy_provider *provider;
++	struct fh8626_usb_phy *p;
++	struct phy *phy;
++
++	p = devm_kzalloc(dev, sizeof(*p), GFP_KERNEL);
++	if (!p)
++		return -ENOMEM;
++
++	p->pmu = syscon_regmap_lookup_by_phandle(dev->of_node, "fullhan,pmu");
++	if (IS_ERR(p->pmu))
++		return dev_err_probe(dev, PTR_ERR(p->pmu),
++				     "cannot get the PMU syscon\n");
++
++	p->vbus = devm_regulator_get_optional(dev, "vbus");
++	if (IS_ERR(p->vbus)) {
++		if (PTR_ERR(p->vbus) != -ENODEV)
++			return dev_err_probe(dev, PTR_ERR(p->vbus),
++					     "cannot get the vbus regulator\n");
++		p->vbus = NULL;
++	}
++
++	phy = devm_phy_create(dev, NULL, &fh8626_usb_phy_ops);
++	if (IS_ERR(phy))
++		return dev_err_probe(dev, PTR_ERR(phy),
++				     "cannot create the PHY\n");
++
++	phy_set_drvdata(phy, p);
++
++	provider = devm_of_phy_provider_register(dev, of_phy_simple_xlate);
++	return PTR_ERR_OR_ZERO(provider);
++}
++
++static const struct of_device_id fh8626_usb_phy_of_match[] = {
++	{ .compatible = "fullhan,fh8626-usb-phy" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, fh8626_usb_phy_of_match);
++
++static struct platform_driver fh8626_usb_phy_driver = {
++	.probe	= fh8626_usb_phy_probe,
++	.driver	= {
++		.name		= "phy-fh8626-usb",
++		.of_match_table	= fh8626_usb_phy_of_match,
++	},
++};
++module_platform_driver(fh8626_usb_phy_driver);
++
++MODULE_DESCRIPTION("Fullhan FH8626V200 USB 2.0 PHY driver");
++MODULE_LICENSE("GPL");
+diff --git a/include/dt-bindings/clock/fullhan,fh8626-pmu.h b/include/dt-bindings/clock/fullhan,fh8626-pmu.h
+new file mode 100644
+index 0000000..4374f04
+--- /dev/null
++++ b/include/dt-bindings/clock/fullhan,fh8626-pmu.h
+@@ -0,0 +1,14 @@
++/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
++/*
++ * Clock IDs of the Fullhan FH8626V200 PMU clock provider.
++ */
++#ifndef _DT_BINDINGS_CLOCK_FULLHAN_FH8626_PMU_H
++#define _DT_BINDINGS_CLOCK_FULLHAN_FH8626_PMU_H
++
++#define FH8626_CLK_PLL_CPU_P	0
++#define FH8626_CLK_CPU_DIV15	1
++#define FH8626_CLK_UART0	2
++#define FH8626_CLK_I2C0		3
++#define FH8626_CLK_CIS		4	/* sensor MCLK output (cis_clk_out) */
++
++#endif

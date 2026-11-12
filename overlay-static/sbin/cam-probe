@@ -1,0 +1,939 @@
+#!/bin/sh
+# Camera bring-up probe (milestone 1, see docs/CAM.md). Pokes registers by hand
+# to verify the stock-firmware findings before they go into drivers.
+#
+#   cam-probe show          read-only: PMU clocks/gates, sensor pads, I2C0 IP
+#   cam-probe pins          mux pads 5-8 to I2C0_SCL/SDA, SENSOR_CLK, GPIO13 (stock settings)
+#   cam-probe mclk [DIV]    enable cis_clk_out (sensor MCLK); DIV sets 0x28[23:16]
+#   cam-probe reset         pulse sensor reset (GPIO13, active low)
+#   cam-probe id [ADDR]     scan I2C0, read SC2336 chip ID 0x3107/0x3108 (default 0x30)
+#   cam-probe irq [ADDR]    unbind the driver, run one transfer by hand, find its GIC line
+#   cam-probe all           show, pins, mclk, reset, id
+#   cam-probe csi [CODE]    MIPI clocks on, stock wrap + CSI-2 host init, 2 lanes;
+#                           CODE = D-PHY frequency code (default 8: 300-499 Mbit/s)
+#   cam-probe stream [CODE] unbind the sensor driver, csi, load the SC2336 mode
+#                           table, start streaming, then show csi status twice;
+#                           PATTERN=1 switches the sensor test pattern on
+#   cam-probe status        CSI-2 host + wrap status (error registers clear on read)
+#   cam-probe stop          stop streaming, rebind the sensor driver
+#   cam-probe raw [FILE]    stream, set up the ISP input and its raw dump (tap point 0,
+#                           10-bit) into the reserved area, then copy one frame to FILE;
+#                           with KEEP=1 sensor and ISP keep running afterwards
+#   cam-probe rearm         (running stream) try to restart the dump DMA, report extent
+#   cam-probe ispcmp        print ISP registers that differ from the running stock firmware
+#   cam-probe stock [FILE]  sensor + MIPI, then the complete emulated stock bring-up
+#                           (FH_SYS_Init, API_ISP_*, VPSS channel 0 NV12); copy a frame;
+#                           DMU=1 uses the stock runtime line buffer partition tables,
+#                           DMU=2 those of change_dmu_isp (isp.ko);
+#                           SKIP="22 29:1-170" leaves out replay groups (or writes
+#                           FROM-TO within a group, see groups); POKE="0xe8400030=0x..."
+#                           writes after the replay; the ISP soft reset runs first
+#                           (RESET=0: not; RESTORE=1: snap values instead); STOCKSET="0x250-0x26c"
+#                           writes stock runtime values for ISP offset ranges after the
+#                           replay; "result: PASS|BLACK|FAIL" and the test pattern bars
+#                           RAWOUT=FILE also dumps the ISP input (tap 0, RAW10) to FILE,
+#                           TAP=1..6 a later point of the pipeline (2: 10 bit, 3-5: 12 bit,
+#                           6: RGB 3 x 12 bit, only with ONELINE=1: one line, stride 0)
+#   cam-probe own [FILE]    as stock, but replays our own register list /etc/cam-own.regs
+#                           (no vendor values); SKIP/POKE as for stock; OWN=1 cam-probe
+#                           groups lists its groups
+#   cam-probe groups        the replay as numbered groups (consecutive writes of one
+#                           stock function), the unit of SKIP
+#   cam-probe snap          (right after boot) save the reset values of the replayed
+#                           registers (for ispreset, RESTORE=1 and the +0x30 reset value)
+#   cam-probe ispdump [FILE]  all readable ISP registers (+0x000-+0x1f3c) into FILE
+#   cam-probe ispreset      stop the ISP/VPU units, try the stock soft resets (+0x40),
+#                           count registers that differ from the snap values
+#   cam-probe vpustock [FILE]  raw setup, then the emulated stock VPSS sequence (channel 0,
+#                           1920x1080 NV12) with per-frame kickoff; copy one frame to FILE
+#   cam-probe dumpext       (running stream, dump on) bytes the raw dump writes per frame
+#   cam-probe isr           interrupt counters of the fh8626-isp-bringup driver
+#   cam-probe bitscan REG BIT...  (running stream) toggle each ISP REG bit, report dumpext
+#   cam-probe vpu [FILE]    raw setup, then VPU channel CHN (0/1) as 1920x1080 NV12 into
+#                           the reserved area (identity scaler), copy one frame to FILE
+
+PMU=0xf0000000
+I2C0=0xf0200000
+GICD=0x30001000			# ISPENDR1/2 at +0x204/+0x208 cover IDs 32..95
+I2C_DRV=/sys/bus/platform/drivers/i2c_designware
+GPIO0=0xf0300000		# DW APB GPIO: +0x00 data, +0x04 direction (1 = out)
+RST_BIT=13			# sensor reset: GPIO13 = GPIO0 bit 13 (pad 8)
+GATE_REG=0x1c			# gate bit set = clock off: i2c0_clk bit 12, cis_clk_out bit 23
+I2C0_GATE=12
+MCLK_GATE=23
+CSI=0xf1100000			# Synopsys DW MIPI CSI-2 host 1.30a
+DPHY=0xf1700000			# Fullhan D-PHY settings
+WRAP=0xf1000000			# MIPI wrap (to the ISP)
+ISP=0xe8400000
+ISPDEV=/sys/bus/platform/devices/e8400000.isp	# fh8626-isp-bringup (interrupt service)
+DUMP=0xa3b00000			# raw dump inside reserved-memory isp-dump (DTS, 16 MiB at 0xa3000000)
+W=1920 H=1080
+STRIDE=2400			# (1920 * 10 bits + 7) / 8, rounded up to 8
+SENSOR=0-0030
+SENSOR_DRV=/sys/bus/i2c/drivers/sc2336
+SENSOR_REGS=/etc/sc2336-1080p30.regs
+ISP_INIT=/etc/isp-init.regs	# stock ISP back-end defaults, only in private builds
+ISP_STOCK=/etc/isp-stock-runtime.txt	# ISP registers of the running stock firmware (private)
+VPU_INIT=/etc/vpu-init.regs	# stock VPSS bring-up, from scripts/stockemu.py (private)
+STOCK_INIT=/etc/stock-init.regs	# complete stock bring-up (VPU + ISP + VPSS), stockemu.py full
+OWN_INIT=/etc/cam-own.regs	# our own bring-up (scripts/cam-own-regs.py), for cam-probe own
+BOOT_SNAP=/tmp/isp-boot.regs	# reset values of the replayed registers (cam-probe snap)
+ISP_USED=/tmp/isp-used		# created by isp_clocks: the ISP no longer has its reset values
+SNAP_END=0xe8401f40		# VPU scaler coefficient banks from here on: reads hang the bus
+
+rd() { devmem $(($1)) 32; }
+wr() { devmem $(($1)) 32 $(($2)); }
+bit() { echo $(( ($(rd $1) >> $2) & 1 )); }
+gate_on() { wr $((PMU + GATE_REG)) $(( $(rd $((PMU + GATE_REG))) & ~(1 << $1) )); }
+
+# Pad register, as written by the stock fh_pinctrl: [27:24] function, 20 pull-up,
+# 16 pull-down, [6:4] drive strength; bits 8, 12 and 28 are always set (bit 12
+# not on MIPI pads). pad PAD FUNC PULL(up|none) DRIVE
+pad() {
+	r=$((PMU + 0x80 + 4 * $1))
+	v=$(( $(rd $r) & ~((0xf << 24) | (1 << 20) | (1 << 16) | (7 << 4)) ))
+	[ $3 = up ] && v=$((v | (1 << 20)))
+	wr $r $(( v | ($2 << 24) | ($4 << 4) | (1 << 28) | (1 << 12) | (1 << 8) ))
+	printf '  pad %-2s %s\n' $1 $(rd $r)
+}
+
+pins() {
+	echo "== pinmux (after reset, these pads come up as GPIO, function 1)"
+	pad 5 0 up 0		# I2C0_SCL
+	pad 6 0 up 0		# I2C0_SDA
+	pad 7 0 none 4		# SENSOR_CLK
+	pad 8 0 none 0		# GPIO13
+}
+
+show() {
+	echo "== PMU clock registers"
+	for off in 0x10 0x14 0x18 0x1c 0x20 0x24 0x28 0x2c 0x34 0x38 0x5c 0x64; do
+		printf '  PMU+%-4s %s\n' $off $(rd $((PMU + off)))
+	done
+	echo "  gate bits in 0x1c: i2c0(12)=$(bit $((PMU + GATE_REG)) $I2C0_GATE)" \
+	     "cis_clk_out(23)=$(bit $((PMU + GATE_REG)) $MCLK_GATE)"
+	echo "  cis_clk_out divider 0x28[23:16] = $(( ($(rd $((PMU + 0x28))) >> 16) & 0xff ))"
+	echo "  i2c0_clk divider 0x34[21:16]    = $(( ($(rd $((PMU + 0x34))) >> 16) & 0x3f ))"
+	echo "  cpu_div15 divider 0x38[31:24]   = $(( ($(rd $((PMU + 0x38))) >> 24) & 0xff ))"
+	echo "== Pad registers (PMU+0x80+4*pad)"
+	for pad in 3:UART0_TX 4:UART0_RX 5:I2C0_SCL 6:I2C0_SDA 7:SENSOR_CLK 8:GPIO13 \
+		   42:MIPI_DP0 45:MIPI_CKP; do
+		n=${pad%%:*}
+		printf '  pad %-2s %-10s %s\n' $n ${pad#*:} $(rd $((PMU + 0x80 + 4 * n)))
+	done
+	echo "== GPIO0: data $(rd $GPIO0) dir $(rd $((GPIO0 + 4)))"
+	if [ ! -e /sys/bus/i2c/devices/i2c-0 ]; then
+		echo "== I2C0: no i2c-0 adapter (driver not probed, see dmesg)"
+	elif [ $(bit $((PMU + GATE_REG)) $I2C0_GATE) = 1 ]; then
+		# the driver gates i2c0_clk while idle (runtime PM); registers read 0
+		echo "== I2C0: i2c0_clk gated (driver idle), registers not readable"
+	else
+		echo "== I2C0: COMP_PARAM_1 $(rd $((I2C0 + 0xf4))) VERSION $(rd $((I2C0 + 0xf8)))" \
+		     "TYPE $(rd $((I2C0 + 0xfc))) (DesignWare = 0x44570140)"
+	fi
+	grep -i i2c /proc/interrupts
+}
+
+mclk() {
+	gate_on $MCLK_GATE
+	if [ -n "$1" ]; then
+		d=$(rd $((PMU + 0x28)))
+		wr $((PMU + 0x28)) $(( (d & ~0xff0000) | (($1 & 0xff) << 16) ))
+	fi
+	echo "mclk: PMU+0x1c $(rd $((PMU + GATE_REG))), PMU+0x28 $(rd $((PMU + 0x28)))"
+}
+
+reset() {
+	m=$((1 << RST_BIT))
+	wr $GPIO0 $(( $(rd $GPIO0) & ~m ))
+	wr $((GPIO0 + 4)) $(( $(rd $((GPIO0 + 4))) | m ))
+	usleep 10000
+	wr $GPIO0 $(( $(rd $GPIO0) | m ))
+	usleep 20000
+	echo "reset: GPIO0 data $(rd $GPIO0) dir $(rd $((GPIO0 + 4)))"
+}
+
+id() {
+	a=${1:-0x30}
+	i2cdetect -y -r 0
+	# SC2336 has 16-bit register addresses; expected ID 0xcb 0x3a
+	echo "chip ID @$a (0x3107/0x3108): $(i2ctransfer -y 0 w2@$a 0x31 0x07 r2)"
+}
+
+# Print the GIC IDs (32..95) that are pending in the snapshot "$1 $2" but not in "$3 $4".
+pending_diff() {
+	for w in 1 2; do
+		eval a=\$$w b=\$$((w + 2))
+		x=$(( a & ~b ))
+		for i in $(seq 0 31); do
+			[ $(( (x >> i) & 1 )) = 1 ] && echo -n " $((32 * w + i))(SPI $((32 * w + i - 32)))"
+		done
+	done
+	echo
+}
+
+# Without the driver: one address-only read, then see whether the controller
+# finishes (STOP_DET/TX_ABRT) and which GIC line its level interrupt drives.
+irq() {
+	a=${1:-0x30}
+	[ -e $I2C_DRV/f0200000.i2c ] && echo f0200000.i2c > $I2C_DRV/unbind
+	gate_on $I2C0_GATE			# unbinding released i2c0_clk
+	# timing the driver computed from the i2c0_clk rate (kept while gated)
+	echo "driver timing: ss scl hcnt/lcnt $(rd $((I2C0 + 0x14)))/$(rd $((I2C0 + 0x18)))"
+	wr $((I2C0 + 0x6c)) 0			# IC_ENABLE off
+	wr $((I2C0 + 0x00)) 0x63		# IC_CON: master, standard speed, restart, no slave
+	wr $((I2C0 + 0x04)) $a			# IC_TAR
+	wr $((I2C0 + 0x30)) 0x240		# IC_INTR_MASK: TX_ABRT | STOP_DET
+	rd $((I2C0 + 0x40)) >/dev/null		# IC_CLR_INTR
+	wr $((I2C0 + 0x6c)) 1
+	wr $((I2C0 + 0x10)) 0x300		# IC_DATA_CMD: read one byte, STOP
+	usleep 20000
+	echo "raw_intr $(rd $((I2C0 + 0x34))) (bit6 TX_ABRT, bit9 STOP_DET)" \
+	     "abrt_src $(rd $((I2C0 + 0x80))) (bit0 addr NACK)"
+	echo "status $(rd $((I2C0 + 0x70))) (bit5 master active) rxflr $(rd $((I2C0 + 0x78)))" \
+	     "scl hcnt/lcnt $(rd $((I2C0 + 0x14)))/$(rd $((I2C0 + 0x18)))"
+	p1=$(rd $((GICD + 0x204))) p2=$(rd $((GICD + 0x208)))
+	wr $((I2C0 + 0x30)) 0			# mask: the level line drops
+	rd $((I2C0 + 0x40)) >/dev/null
+	usleep 1000
+	q1=$(rd $((GICD + 0x204))) q2=$(rd $((GICD + 0x208)))
+	echo "GICD pending $p1 $p2 -> masked $q1 $q2"
+	echo -n "I2C0 interrupt line:"
+	pending_diff $p1 $p2 $q1 $q2
+	wr $((I2C0 + 0x6c)) 0
+	echo f0200000.i2c > $I2C_DRV/bind
+}
+
+clr() { wr $1 $(( $(rd $1) & ~($2) )); }
+set_bits() { wr $1 $(( $(rd $1) | ($2) )); }
+
+# Stock init (isp.ko mipiWrap_Init + mipiCtrl_Init, libmipi order: wrap first)
+# with the stock SC2336P cfg { code, 0, 1, 0, 0, 2 }, see docs/CAM.md.
+csi() {
+	code=${1:-8}
+	clr $((PMU + 0x20)) "1 << 29"			# mipi_wrap_gate on
+	clr $((PMU + 0x5c)) "(1 << 6) | (1 << 4)"	# mipi_dphy_clk, mipi_cfg_clk on
+	# wrap
+	clr $((PMU + 0x4c)) "1 << 13"
+	wr $WRAP 0x06800004
+	wr $((WRAP + 0x10)) 1
+	usleep 10
+	wr $((WRAP + 0x10)) 0
+	wr $WRAP 0x04800004			# cfg bit 0 = 0: bit 25 cleared
+	wr $((WRAP + 0x04)) 0x79
+	wr $((WRAP + 0x08)) 1
+	# CSI-2 host + D-PHY
+	set_bits $((PMU + 0x2108)) "1 << 4"
+	clr $((PMU + 0x4c)) "1 << 14"
+	wr $((CSI + 0x40)) 1			# PHY_SHUTDOWNZ
+	wr $((CSI + 0x44)) 1			# DPHY_RSTZ
+	wr $((CSI + 0x08)) 0xffffffff		# CSI2_RESETN
+	wr $((DPHY + 0x04)) 1
+	for off in 0x30 0x34 0x38 0x3c 0x40; do wr $((DPHY + off)) 10000; done
+	wr $((DPHY + 0x20)) 0x01140114
+	wr $((DPHY + 0x24)) 0x01010101
+	wr $((DPHY + 0x28)) $(( code * 0x01010101 ))
+	wr $((CSI + 0x04)) 1			# N_LANES: 2 lanes
+	for off in 0xe4 0xf4 0x104 0x114 0x124 0x134; do wr $((CSI + off)) 0xffffffff; done
+	echo "csi: code $code, VERSION $(rd $CSI) N_LANES $(rd $((CSI + 4))) wrap $(rd $WRAP)"
+}
+
+status() {
+	echo "== CSI-2 host: INT_ST_MAIN $(rd $((CSI + 0x0c))) PHY_RX $(rd $((CSI + 0x48)))" \
+	     "(bit17 clock lane HS) PHY_STOPSTATE $(rd $((CSI + 0x4c)))"
+	echo "   errors (clear on read): phy_fatal $(rd $((CSI + 0xe0))) pkt_fatal $(rd $((CSI + 0xf0)))" \
+	     "frame_fatal $(rd $((CSI + 0x100))) phy $(rd $((CSI + 0x110)))" \
+	     "pkt $(rd $((CSI + 0x120))) line $(rd $((CSI + 0x130)))"
+	echo -n "== wrap:"
+	for off in 0x00 0x04 0x08 0x0c 0x10 0x14 0x18 0x1c 0x20 0x24 0x28 0x2c 0x30 0x34 0x38 0x3c; do
+		echo -n " $(rd $((WRAP + off)))"
+	done
+	echo
+}
+
+stream() {
+	[ -f $SENSOR_REGS ] || { echo "no $SENSOR_REGS"; return 1; }
+	[ -e $SENSOR_DRV/$SENSOR ] && echo $SENSOR > $SENSOR_DRV/unbind
+	csi "$1"
+	mclk && reset || return 1
+	n=0
+	while read reg val; do
+		i2ctransfer -y 0 w3@0x30 0x${reg%??} 0x${reg#??} 0x$val || return 1
+		[ $reg = 0103 ] && usleep 10000		# software reset
+		n=$((n + 1))
+	done < $SENSOR_REGS
+	if [ -n "$PATTERN" ]; then			# sensor test pattern (0x4501 bit 3)
+		v=$(i2ctransfer -y 0 w2@0x30 0x45 0x01 r1)
+		i2ctransfer -y 0 w3@0x30 0x45 0x01 $((v | 8))
+	fi
+	i2ctransfer -y 0 w3@0x30 0x01 0x00 0x01		# streaming on
+	echo "sensor: $n registers written, streaming on"
+	usleep 200000
+	status
+	usleep 500000
+	status
+}
+
+isp_status() {
+	echo "== ISP: int $(rd $((ISP + 0x04))) +0x28 $(rd $((ISP + 0x28))) +0x100 $(rd $((ISP + 0x100)))" \
+	     "in_size $(rd $((ISP + 0x130))) vi_stat $(rd $((ISP + 0x1460))) $(rd $((ISP + 0x1468)))"
+	echo "   dump: tap $(rd $((ISP + 0x120))) addr $(rd $((ISP + 0x124))) stride $(rd $((ISP + 0x128)))" \
+	     "| buffer +0 $(rd $DUMP) +1M $(rd $((DUMP + 0x100000))) +2.5M-4 $(rd $((DUMP + STRIDE * H - 4)))"
+}
+
+# ISP back end as the stock isp_startup leaves it (Ispf_Init, SetIspPicSize), from
+# $ISP_INIT if the image has it; a linear gamma curve instead of the stock one; then
+# +0x28 as on the running stock firmware.
+ispinit() {
+	[ -f $ISP_INIT ] || { echo "ispinit: no $ISP_INIT, skipped"; return; }
+	n=0
+	while read off val; do
+		case $off in \#*|'') continue ;; esac
+		case $val in
+		\|*)	set_bits $((ISP + off)) ${val#|} ;;
+		*)	wr $((ISP + off)) $val ;;
+		esac
+		n=$((n + 1))
+	done < $ISP_INIT
+	k=0
+	while [ $k -lt 128 ]; do
+		wr $((ISP + 0x690 + 4 * k)) $(( (2 * k * 256) | ((2 * k + 1) * 256) << 16 ))
+		k=$((k + 1))
+	done
+	# stock runtime value; ISP28=0x0008db94 gives the value Ispf_Init sets (fewer modules?)
+	wr $((ISP + 0x28)) ${ISP28:-0x0218c200}
+	echo "ispinit: $n writes from $ISP_INIT, linear gamma, +0x28 $(rd $((ISP + 0x28)))"
+}
+
+isp_clocks() {
+	[ -f $ISP_USED ] && isp_quiesce
+	touch $ISP_USED
+	clr $((PMU + 0x20)) "(1 << 23) | (1 << 1)"	# pix_clk, adapt_hclk_gate on
+	# the other bus adapter clocks of isp.ko vpu_init_clk
+	clr $((PMU + 0x5c)) "(1 << 26) | (1 << 27)"	# veu_adapt_clk, veu_adapt_hclk on
+	clr $((PMU + 0x1c)) "1 << 29"			# jpeg_adapt_clk on
+	# pix_clk 1500/15 = 100 MHz as on the running stock firmware (cam-regdump; ours
+	# were 214 MHz), jpg_hclk and veu_hclk on. isp_aclk: stock reads 1500/30 = 50 MHz,
+	# but the ISP back end handles one pixel per isp_aclk cycle, and 50 MHz covers
+	# only 1388 of the 1920 pixels in a 27.8 us sensor line (HTS 2250 at 81 MHz):
+	# lines lose their tail and the frame ends after ~780 lines. 1500/15 = 100 MHz
+	# (ACLK_DIV = divider - 1).
+	wr $((PMU + 0x24)) $(( ($(rd $((PMU + 0x24))) & ~(0x3f << 8)) | (${ACLK_DIV:-0x0e} << 8) ))
+	wr $((PMU + 0x2c)) $(( ($(rd $((PMU + 0x2c))) & ~(0xf << 24)) | (0xe << 24) ))
+	clr $((PMU + 0x20)) "1 << 31"
+	clr $((PMU + 0x5c)) "1 << 25"
+}
+
+# An earlier run leaves the ISP input, the VPU units and their DMA running (stop only
+# stops the sensor). Reconfiguring under them hangs the bus, e.g. when an address
+# register is written while its unit is enabled: stop them first.
+isp_quiesce() {
+	if [ -d $ISPDEV ]; then				# no kickoff re-enabling a channel
+		echo 0 > $ISPDEV/mask; echo -1 > $ISPDEV/vpu_chn
+	fi
+	wr $((ISP + 0x100)) 0				# isp_driver_pipline_pause
+	wr $((ISP + 0x34)) 4
+	v30=$( [ -f $BOOT_SNAP ] && awk '$1 == "0xe8400030" { print $2 }' $BOOT_SNAP)
+	if [ -n "$v30" ]; then
+		wr $((ISP + 0x30)) $v30			# reset value: all VPU units off
+	else
+		clr $((ISP + 0x30)) "(7 << 20) | (3 << 17)"	# channels 0-2, CPY, BGM
+	fi
+	usleep 100000					# 3 frames for the DMA to drain
+}
+
+# Soft resets of the stock isp.ko (class B, unverified): isp_reset sets +0x40 bit 0,
+# isp_core_reset bit 1, then each waits up to 1 ms for the same bit in +0x44.
+isp_softreset() {
+	for b in 0 1; do
+		set_bits $((ISP + 0x40)) "1 << $b"
+		k=0
+		while [ $(( ($(rd $((ISP + 0x44))) >> b) & 1 )) = 0 ] && [ $k -lt 100 ]; do
+			usleep 1000; k=$((k + 1))
+		done
+		echo "softreset: bit $b, +0x40 $(rd $((ISP + 0x40))) +0x44 $(rd $((ISP + 0x44))) after $k ms"
+	done
+}
+
+# Does the soft reset bring the replayed registers back to their reset values?
+# Needs $BOOT_SNAP, best after a stock run (KEEP=1 or not).
+ispreset() {
+	[ -f $BOOT_SNAP ] || { echo "ispreset: no $BOOT_SNAP (cam-probe snap after boot)"; return 1; }
+	isp_quiesce
+	before=$(snapdiff)
+	isp_softreset
+	echo "ispreset: registers differing from the reset values: before $before, after $(snapdiff)"
+	SHOW=10 snapdiff > /dev/null
+}
+
+# All readable ISP registers (+0x000 to below the scaler coefficient banks) into FILE,
+# one "OFFSET VALUE" per line, for comparing two states on the host.
+ispdump() {
+	o=0
+	while [ $o -lt $((SNAP_END - ISP)) ]; do
+		printf '0x%04x %s\n' $o $(rd $((ISP + o)))
+		o=$((o + 4))
+	done > ${1:-/tmp/isp-dump.txt}
+	echo "ispdump: $(wc -l < ${1:-/tmp/isp-dump.txt}) registers in ${1:-/tmp/isp-dump.txt}"
+}
+
+# Number of $BOOT_SNAP registers whose value differs now; SHOW=N prints the first N.
+snapdiff() {
+	d=0
+	while read addr val; do
+		v=$(rd $addr)
+		[ $((v)) = $((val)) ] && continue
+		d=$((d + 1))
+		[ $d -le ${SHOW:-0} ] && echo "   $addr reset $val now $v" >&2
+	done < $BOOT_SNAP
+	echo $d
+}
+
+isp_input_on() {
+	wr $((ISP + 0x100)) 4				# isp_startup_Isp_PkgEnable
+	wr $((ISP + 0x34)) 5
+	set_bits $((ISP + 0x100)) 1
+}
+
+# Stock order (libispcore isp_startup, isp_core_system_reset, handle_isp_interrupt):
+# clocks, system reset bits, input size, raw dump registers, VI enable.
+raw() {
+	out=${1:-/tmp/raw.bin}
+	size=$(( (STRIDE * H + 4095) / 4096 * 4096 ))
+	memcat -z $DUMP $size			# uncached: unwritten lines stay 0
+	for off in 0 0x100000 $((STRIDE * H - 4)); do wr $((DUMP + off)) 0xdeadbeef; done
+	stream || return 1
+	isp_clocks
+	echo "isp: PMU+0x1c $(rd $((PMU + 0x1c))) +0x20 $(rd $((PMU + 0x20))) +0x24 $(rd $((PMU + 0x24)))" \
+	     "+0x2c $(rd $((PMU + 0x2c))) +0x5c $(rd $((PMU + 0x5c)))"
+	# ISP DMA addresses the stock stack sets: +0xfc (unknown buffer, stock 0xa3790000),
+	# statistics +0x524 / +0x4ec (ispp_set_stat_addr). Point them into the reserved area.
+	echo "isp: before +0xfc $(rd $((ISP + 0xfc))) +0x4ec $(rd $((ISP + 0x4ec))) +0x524 $(rd $((ISP + 0x524)))"
+	wr $((ISP + 0xfc)) $((DUMP + 0x300000))
+	wr $((ISP + 0x524)) $((DUMP + 0x340000))
+	wr $((ISP + 0x4ec)) $((DUMP + 0x340000 + 0x2030))
+	wr $((ISP + 0xf0)) $(( ($(rd $((ISP + 0xf0))) & ~0x30) | 0x10 ))
+	wr $((ISP + 0xf4)) $(( ($(rd $((ISP + 0xf4))) & ~0x03) | 0x02 ))
+	sz=$(( (W - 1) | ((H - 1) << 16) ))
+	wr $((ISP + 0x130)) $sz
+	wr $((ISP + 0x144)) $sz
+	ispinit
+	ispstock
+	wr $((ISP + 0x120)) $(( $(rd $((ISP + 0x120))) & ~0x1f ))	# tap point 0
+	wr $((ISP + 0x128)) $STRIDE
+	wr $((ISP + 0x124)) $DUMP
+	set_bits $((ISP + 0x28)) "1 << 26"			# dump enable
+	if [ -d $ISPDEV ]; then
+		# real-time part in the kernel: statistics buffer switch and dump re-arm per frame
+		echo $(printf '%x' $((DUMP + 0x340000))) > $ISPDEV/stat_addr
+		echo $(printf '%x' $DUMP) > $ISPDEV/dump_addr
+		echo 0 > $ISPDEV/counts
+		# isp_startup_Ispp_Init enables 0x07ffffff; bit 2 (ISPP overflow) storms here
+		echo ${ISPMASK:-7fffffb} > $ISPDEV/mask
+	else
+		echo "raw: no $ISPDEV, ISP interrupt not serviced"
+	fi
+	# NOSTART=1: everything is set up, but the ISP input is not switched on yet
+	# (vpustock configures the VPU first, as the stock firmware does)
+	[ -n "$NOSTART" ] && { echo "raw: NOSTART, ISP input not started"; return 0; }
+	isp_input_on
+	isp_status
+	usleep 300000
+	isp_status
+	# one-time stall or rewritten every frame?
+	memcat -z $DUMP 4096
+	usleep 100000
+	echo "rewrite check: buffer +0 after clearing and 100 ms: $(rd $DUMP)"
+	for i in 1 2 3; do
+		echo "   +0x114 $(rd $((ISP + 0x114))) vi_stat $(rd $((ISP + 0x1460)))"
+		usleep 30000
+	done
+	clr $((ISP + 0x28)) "1 << 26"			# dump off: keep the last frame
+	usleep 100000
+	memcat $DUMP $size > $out		# uncached, not through dd and the cache
+	echo "raw: $out ($(wc -c < $out) bytes, ${W}x${H} 10-bit packed, stride $STRIDE)"
+	[ -n "$KEEP" ] && { echo "KEEP set: sensor and ISP keep running (cam-probe stop)"; return; }
+	stop
+}
+
+# Apply the register values of the running stock firmware (Ispf_Init's values are only
+# initial values: stock switches several modules off again later). Not written:
+# status/counters, statistics DMA, our dump and input control, and the VPU registers
+# (set by vpu()). ISPSTOCK=0 skips it.
+ispstock() {
+	[ "${ISPSTOCK:-1}" = 1 ] || { echo "ispstock: skipped"; return; }
+	[ -f $ISP_STOCK ] || { echo "ispstock: no $ISP_STOCK, skipped"; return; }
+	n=0
+	while read off val; do
+		case $off in \#*|'') continue ;; esac
+		o=$((off))
+		case $o in
+		0|4|16|20|24|48|100|252|256|276|288|292|296|672|676|732|736) continue ;;
+		1260|1316) continue ;;	# statistics DMA +0x4ec/+0x524: stock rewrites them per frame
+		esac
+		[ $o -ge $((0xec0)) ] && [ $o -lt $((0x1400)) ] && continue	# VPU, logo
+		[ $o -ge $((0x1400)) ] && continue				# statistics
+		[ -n "$ISPSTOCK_VERBOSE" ] && echo "ispstock: +$off = $val"
+		wr $((ISP + o)) $val
+		n=$((n + 1))
+	done < $ISP_STOCK
+	echo "ispstock: $n registers set to the stock runtime values"
+}
+
+# Stock runtime values ($ISP_STOCK) for the ISP offset ranges in $STOCKSET, e.g.
+# STOCKSET="0x250-0x26c 0xa64-0xa70" (a single offset is a range of one).
+stockset() {
+	[ -f $ISP_STOCK ] || { echo "stockset: no $ISP_STOCK"; return 1; }
+	n=0
+	for r in $STOCKSET; do
+		lo=$((${r%-*})) hi=$((${r#*-}))
+		while read off val; do
+			case $off in \#*|'') continue ;; esac
+			[ $((off)) -ge $lo ] && [ $((off)) -le $hi ] || continue
+			wr $((ISP + off)) $val
+			n=$((n + 1))
+		done < $ISP_STOCK
+	done
+	echo "stockset: $n registers set to the stock runtime values ($STOCKSET)"
+}
+
+# Y, U, V at the centres of the eight 240-pixel bars of the sensor test pattern
+# (PATTERN=1), on the middle line. Full-range BT.601 bars would read about
+# Y 255 226 179 150 105 76 29 0 (white, yellow, cyan, green, magenta, red, blue, black).
+bars() {
+	for p in Y U V; do
+		echo -n "bars $p:"
+		k=0
+		while [ $k -lt 8 ]; do
+			x=$((120 + 240 * k))
+			case $p in
+			Y) a=$(($1 + (H / 2) * W + x)) ;;
+			U) a=$(($2 + (H / 4) * W + x)) ;;
+			V) a=$(($2 + (H / 4) * W + x + 1)) ;;
+			esac
+			printf ' %3d' $(( ($(rd $((a & ~3))) >> (8 * (a & 3))) & 0xff ))
+			k=$((k + 1))
+		done
+		echo
+	done
+}
+
+ispcmp() {
+	[ -f $ISP_STOCK ] || { echo "ispcmp: no $ISP_STOCK"; return 1; }
+	n=0 d=0
+	while read off val; do
+		case $off in \#*|'') continue ;; esac
+		v=$(rd $((ISP + off)))
+		n=$((n + 1))
+		[ $((v)) = $((val)) ] && continue
+		printf '%s stock %s ours %s\n' $off $val $v
+		d=$((d + 1))
+	done < $ISP_STOCK
+	echo "ispcmp: $d of $n registers differ"
+}
+
+# VPU channel CHN (0 or 1, default 0), 1920x1080 NV12, 1:1 (registers inside the ISP
+# block, see docs/CAM.md). In stock, channel 0 only runs in loopbuf mode (to the encoder);
+# the DDR outputs are channels 1 and 2. Scaler coefficients: identity filter in the format
+# of the stock table (2 words per phase, 10-bit signed taps in Q8 at bits 0/10/20).
+vpu() {
+	vout=${1:-/tmp/nv12.bin}		# not "out": raw() sets that (sh has no locals)
+	ysize=$((W * H))
+	case ${CHN:-0} in
+	0) crop=0xf04 ch=0xf0c ow=0xf08 oh=0xf10 st=0xf2c ph=0xf14 sz=0x1200 ad=0x1350 cf=0x1f40 en=20 ;;
+	1) crop=0xf3c ch=0xf44 ow=0xf40 oh=0xf48 st=0xf64 ph=0xf4c sz=0x1208 ad=0x135c cf=0x2740 en=21 ;;
+	*) echo "vpu: CHN must be 0 or 1"; return 1 ;;
+	esac
+	KEEP=1 raw /tmp/raw.bin > /dev/null || return 1
+	clr $((ISP + 0x28)) "1 << 26"			# raw dump off
+	wr $((ISP + 0xf00)) 0x888			# vpu_init_cfg
+	wr $((ISP + crop)) $(( (W - 1) | ((W - 1) << 16) ))
+	wr $((ISP + ch)) $(( (H - 1) | ((H / 2 - 1) << 16) ))
+	wr $((ISP + ow)) $((W - 1))
+	wr $((ISP + oh)) $((H - 1))
+	for i in 0 4 8 12; do wr $((ISP + st + i)) 0x100000; done	# step 1:1
+	for i in 0 4 8 12 16 20; do wr $((ISP + ph + i)) 0; done	# start phases
+	wr $((ISP + sz)) 0
+	wr $((ISP + sz + 4)) $(( (W - 1) | ((H - 1) << 16) ))
+	wr $((ISP + ad + 8)) $(( W | (W << 16) ))	# Y and C stride
+	# channel 1 banks (+0x2740...) gave bus errors: identity coefficients for channel 0 only
+	[ ${CHN:-0} = 0 ] && for bank in 0 0x200 0x400 0x600; do
+		i=0
+		while [ $i -lt 128 ]; do
+			wr $((ISP + cf + bank + 4 * i)) 0x00040000
+			wr $((ISP + cf + bank + 4 * i + 4)) 0
+			i=$((i + 2))
+		done
+	done
+	memcat -z $DUMP $(( (ysize * 3 / 2 + 4095) / 4096 * 4096 ))
+	for o in 0 0x100000 $ysize $((ysize * 3 / 2 - 4)); do wr $((DUMP + o)) 0xdeadbeef; done
+	wr $((ISP + ad)) $DUMP
+	wr $((ISP + ad + 4)) $((DUMP + ysize))
+	wr $((ISP + 0x30)) $(( ($(rd $((ISP + 0x30))) & ~(7 << 20)) | (1 << en) ))	# only this channel
+	if [ -d $ISPDEV ]; then
+		# per-frame kickoff on ISPF start in the kernel (addresses + enable edge)
+		echo $(printf '%x' $DUMP) > $ISPDEV/vpu_y
+		echo $(printf '%x' $((DUMP + ysize))) > $ISPDEV/vpu_c
+		echo ${CHN:-0} > $ISPDEV/vpu_chn
+	fi
+	usleep 300000
+	echo -n "vpu: channel ${CHN:-0}, +0x30 $(rd $((ISP + 0x30))) markers (Y0, Y+1M, C0, C end):"
+	for o in 0 0x100000 $ysize $((ysize * 3 / 2 - 4)); do echo -n " $(rd $((DUMP + o)))"; done
+	echo
+	echo "vpu: DMA idle +0x14 $(rd $((ISP + 0x14))) +0x18 $(rd $((ISP + 0x18))) (stock 0x1fff / 0x7ffff)"
+	[ -d $ISPDEV ] && echo "vpu: kickoff $(cat $ISPDEV/vpu_chn)" && cat $ISPDEV/counts
+	memcat $DUMP $(( (ysize * 3 / 2 + 3) / 4 * 4 )) > $vout
+	echo "vpu: $vout ($(wc -c < $vout) bytes, ${W}x${H} NV12)"
+	[ -n "$KEEP" ] && { echo "KEEP set: sensor, ISP and VPU keep running (cam-probe stop)"; return; }
+	stop
+}
+
+# Bytes of the current raw dump frame: clear the frame, wait 3 frames, find the first
+# zero word in 4 KiB steps.
+dumpext() {
+	size=$(( (STRIDE * H + 4095) / 4096 * 4096 ))
+	set_bits $((ISP + 0x28)) "1 << 26"		# dump on (raw switches it off at the end)
+	memcat -z $DUMP $size
+	usleep 100000
+	o=0
+	while [ $o -lt $size ]; do
+		[ $(rd $((DUMP + o))) = 0x00000000 ] && break
+		o=$((o + 4096))
+	done
+	echo $o
+}
+
+# bitscan REG BIT...: with a running stream and the dump on, toggle each bit of ISP+REG
+# in turn and report how far the dump gets (full frame: about 2592000).
+bitscan() {
+	reg=$1; shift
+	set_bits $((ISP + 0x28)) "1 << 26"		# dump on (raw switches it off at the end)
+	v=$(rd $((ISP + reg)))
+	echo "bitscan: ISP+$reg = $v, baseline dump $(dumpext) bytes"
+	for b in "$@"; do
+		wr $((ISP + reg)) $(( v ^ (1 << b) ))
+		echo "  bit $b toggled ($(rd $((ISP + reg)))): dump $(dumpext) bytes"
+		wr $((ISP + reg)) $v
+	done
+}
+
+# Bisecting the replay. A group is a run of consecutive writes of one stock function
+# (the comment after each write); groups and writes within a group count from 1.
+groups() {
+	[ -f $STOCK_INIT ] || { echo "groups: no $STOCK_INIT"; return 1; }
+	awk -v end=$SNAP_END '
+	/^# ---/ { phase = $3; next }
+	/^#/ || NF == 0 { next }
+	{
+		if ($4 != prev) { g++; fn[g] = $4; ph[g] = phase; lo[g] = $1; hi[g] = $1; prev = $4 }
+		n[g]++
+		if ($1 < lo[g]) lo[g] = $1
+		if ($1 > hi[g]) hi[g] = $1
+	}
+	END {
+		print "  #  function                    writes  ISP offsets  (* = not restorable)"
+		for (i = 1; i <= g; i++)
+			printf "%3d  %-28s %5d  +%s-+%s%s  %s\n", i, fn[i], n[i],
+				substr(lo[i], 7), substr(hi[i], 7), (hi[i] >= end ? " *" : "  "), ph[i]
+	}' $STOCK_INIT
+}
+
+# Gamma table (+0x690-+0x890) and scaler coefficients (from $SNAP_END): RAM that no
+# reset clears, so a skipped write there keeps the value of an earlier run.
+table_ram() {
+	[ $(($1)) -ge $((ISP + 0x690)) ] && [ $(($1)) -le $((ISP + 0x890)) ] && return 0
+	[ $(($1)) -ge $((SNAP_END)) ]
+}
+
+# Is write I of group G in $SKIP? Tokens: G (whole group), G:I or G:FROM-TO.
+skipped() {
+	for t in $SKIP; do
+		case $t in
+		*:*)	[ ${t%%:*} = $1 ] || continue
+			r=${t#*:}
+			[ $2 -ge ${r%-*} ] && [ $2 -le ${r#*-} ] && return 0 ;;
+		*)	[ $t = $1 ] && return 0 ;;
+		esac
+	done
+	return 1
+}
+
+# Reset values of every replayed register below $SNAP_END. Only meaningful before
+# anything has touched the ISP since boot; /tmp is in RAM, so a reboot clears it.
+snap() {
+	[ -f $STOCK_INIT ] || { echo "snap: no $STOCK_INIT"; return 1; }
+	[ -f $BOOT_SNAP ] && { echo "snap: $BOOT_SNAP exists (taken earlier in this boot)"; return 1; }
+	# a snapshot of a configured ISP restores half-configured units: bus hang
+	[ -f $ISP_USED ] && { echo "snap: ISP already used in this boot, reboot first"; return 1; }
+	isp_clocks					# registers read 0 or hang without them
+	grep -v '^#' $STOCK_INIT | awk -v end=$SNAP_END 'NF && $1 < end { print $1 }' | sort -u |
+	while read addr; do
+		echo "$addr $(rd $addr)"
+	done > $BOOT_SNAP.tmp && mv $BOOT_SNAP.tmp $BOOT_SNAP
+	echo "snap: $(wc -l < $BOOT_SNAP) reset values in $BOOT_SNAP"
+}
+
+# PASS: all four markers overwritten and at least one ISPF END (status bit 1).
+# BLACK: as PASS, but 16 Y words spread over the frame are all 0.
+verdict() {
+	m=0
+	for a in $1 $(($1 + 0x100000)) $2 $(($2 + W * H / 2 - 4)); do
+		[ $(rd $a) = 0xdeadbeef ] || m=$((m + 1))
+	done
+	ys= nz=0 k=0
+	while [ $k -lt 16 ]; do
+		v=$(rd $(( ($1 + (2 * k + 1) * (W * H / 32)) & ~3 )))
+		ys="$ys ${v#0x}"
+		[ $((v)) = 0 ] || nz=$((nz + 1))
+		k=$((k + 1))
+	done
+	echo "stock: Y samples$ys"
+	fe=- pe=- pc=-
+	if [ -d $ISPDEV ]; then
+		cnt() { awk -v b="bit $1:" 'index($0, b) == 1 { v = $3 } END { print v + 0 }' $ISPDEV/counts; }
+		fe=$(cnt 1) pe=$(cnt 0) pc=$(cnt 3)
+	fi
+	r=FAIL
+	[ $m = 4 ] && [ "$fe" != 0 ] && r=PASS
+	[ $r = PASS ] && [ $nz = 0 ] && r=BLACK
+	echo "result: $r (markers $m/4, Y nonzero $nz/16, ISPF END $fe, ISPP END $pe, pipe_conflict $pc;" \
+	     "RESTORE=${RESTORE:-0} SKIP=\"$SKIP\" STOCKSET=\"$STOCKSET\" POKE=\"$POKE\")"
+}
+
+# Complete stock bring-up replayed from $STOCK_INIT (scripts/stockemu.py full, DDR
+# allocation from 0xA3000000): vpu-sys 0xA3000000, channel 0 Y 0xA3016000 /
+# C 0xA3214000, ISP buffer 0xA3770000. The replay starts the ISP input itself.
+stock() {
+	vout=${1:-/tmp/nv12.bin}
+	y=0xa3016000 c=0xa3214000
+	ysize=$((W * H))
+	[ -f $STOCK_INIT ] || { echo "stock: no $STOCK_INIT"; return 1; }
+	stream || return 1
+	isp_clocks
+	memcat -z $y $ysize
+	memcat -z $c $((ysize / 2))
+	for a in $y $((y + 0x100000)) $c $((c + ysize / 2 - 4)); do wr $a 0xdeadbeef; done
+	if [ -d $ISPDEV ]; then		# no interrupt service while the replay runs
+		echo 0 > $ISPDEV/mask; echo 0 > $ISPDEV/stat_addr; echo 0 > $ISPDEV/dump_addr
+		echo -1 > $ISPDEV/vpu_chn; echo 0 > $ISPDEV/counts
+	fi
+	# back to the reset values, so that skipped writes leave those (isp_clocks has
+	# stopped the units of an earlier run). The soft reset covers all registers but
+	# not the table RAMs (gamma, scaler coefficients); RESTORE=1 writes the snap
+	# values instead, as before the soft reset was known.
+	if [ "$RESTORE" = 1 ] && [ -f $BOOT_SNAP ]; then
+		r=0
+		while read addr val; do wr $addr $val; r=$((r + 1)); done < $BOOT_SNAP
+		echo "stock: $r registers restored from $BOOT_SNAP"
+	elif [ "${RESET:-1}" = 1 ]; then
+		isp_softreset
+	fi
+	n=0 s=0 stale=0 g=0 i=0 prev=
+	while read addr val hash fn rest; do
+		case $addr in \#*|'') continue ;; esac
+		[ "$fn" = "$prev" ] && i=$((i + 1)) || { g=$((g + 1)) i=1 prev=$fn; }
+		if [ -n "$SKIP" ] && skipped $g $i; then
+			s=$((s + 1))
+			table_ram $addr && stale=$((stale + 1))
+			continue
+		fi
+		# DMU=1: line buffer partition tables of the running stock firmware
+		# instead of the Ispp_Init defaults (no stock code writes these values)
+		[ "$DMU" = 1 ] && case $addr in
+			0xe8400080) val=0x60502010 ;; 0xe8400084) val=0x908f8070 ;;
+			0xe8400090) val=0x10301010 ;; 0xe8400094) val=0x00101010 ;;
+			0xe84000a0) val=0x50482820 ;; 0xe84000a4) val=0x69686058 ;;
+			0xe84000a8) val=0xa8987870 ;; 0xe84000ac) val=0xe8e0c8b8 ;;
+			0xe84000b0) val=0x00fff8f0 ;;
+		esac
+		# DMU=2: the tables of change_dmu_isp (isp.ko)
+		[ "$DMU" = 2 ] && case $addr in
+			0xe8400080) val=0x34302010 ;; 0xe8400084) val=0x00005444 ;;
+			0xe8400090) val=0x04101010 ;; 0xe8400094) val=0x00101010 ;;
+			0xe84000a0) val=0x3424140a ;; 0xe84000a4) val=0x00004544 ;;
+		esac
+		wr $addr $val
+		n=$((n + 1))
+	done < $STOCK_INIT
+	echo "stock: $n writes from $STOCK_INIT, $s skipped (SKIP=\"$SKIP\")," \
+	     "+0x28 $(rd $((ISP + 0x28))) +0x30 $(rd $((ISP + 0x30)))"
+	[ $stale -gt 0 ] && echo "stock: $stale skipped writes to table RAM" \
+		"(no reset): those keep earlier values, reboot for a clean test"
+	[ -n "$STOCKSET" ] && stockset
+	for p in $POKE; do
+		wr ${p%%=*} ${p#*=}
+		echo "stock: poke ${p%%=*} = ${p#*=}"
+	done
+	# YC mean outputs and SAD read address (set by the stock handler at ISPF END)
+	wr $((ISP + 0xed4)) 0xa3006000; wr $((ISP + 0xed8)) 0x00780000
+	wr $((ISP + 0xedc)) 0xa3008000; wr $((ISP + 0xee0)) 0x00f00000
+	wr $((ISP + 0x12dc)) 0xa3610000; wr $((ISP + 0x12e0)) 0x000000f0
+	if [ -d $ISPDEV ]; then
+		echo ${y#0x} > $ISPDEV/vpu_y
+		echo ${c#0x} > $ISPDEV/vpu_c
+		echo 0 > $ISPDEV/vpu_chn
+		echo ${ISPMASK:-7fdffeb} > $ISPDEV/mask	# bit 2/4 storm; bit 17 off: the kickoff kills luma
+	fi
+	usleep 500000
+	echo -n "stock: markers (Y0, Y+1M, C0, C end):"
+	for a in $y $((y + 0x100000)) $c $((c + ysize / 2 - 4)); do echo -n " $(rd $a)"; done
+	echo
+	echo "stock: DMA idle +0x14 $(rd $((ISP + 0x14))) +0x18 $(rd $((ISP + 0x18))) (stock 0x1fff / 0x7ffff)"
+	[ -d $ISPDEV ] && echo "stock: kickoff $(cat $ISPDEV/vpu_chn)" && cat $ISPDEV/counts
+	verdict $y $c
+	bars $y $c
+	memcat $y $ysize > $vout
+	memcat $c $((ysize / 2)) >> $vout
+	echo "stock: $vout ($(wc -c < $vout) bytes, ${W}x${H} NV12)"
+	[ -n "$RAWOUT" ] && stock_raw $RAWOUT
+	[ -n "$KEEP" ] && { echo "KEEP set: keeps running (cam-probe stop)"; return; }
+	stop
+}
+
+# Dump of the pipeline at tap point $TAP (default 0) while the replayed pipeline runs,
+# into $DUMP (outside the replay's buffers, which end at 0xA3A70000). Line stride as
+# in the stock handle_isp_interrupt: taps 0/1 (+0x130 width) and 2 (+0x138 width) in
+# 10 bits, taps 3-5 (+0x138 width) in 12 bits, tap 6 in 3 x 12 bits, rounded up to 8
+# bytes. ONELINE=1 programs a stride of 0, so that every line lands on the same
+# address and only one line is kept: tap 6 (9.3 MB per frame) does not fit otherwise.
+stock_raw() {
+	tap=${TAP:-0}
+	case $tap in
+	0|1)	bits=10 wreg=0x130 ;;
+	2)	bits=10 wreg=0x138 ;;
+	3|4|5)	bits=12 wreg=0x138 ;;
+	6)	bits=36 wreg=0x138
+		[ "$ONELINE" = 1 ] || { echo "stock: tap 6 only with ONELINE=1"; return 1; } ;;
+	*)	echo "stock: tap $tap not supported (0-6)"; return 1 ;;
+	esac
+	w=$(( ($(rd $((ISP + wreg))) & 0xfff) + 1 ))
+	stride=$(( (w * bits / 8 + 7) & ~7 ))
+	lines=$H
+	[ "$ONELINE" = 1 ] && lines=1
+	end=$((stride * lines))
+	size=$(( (end + 4095) / 4096 * 4096 ))
+	memcat -z $DUMP $((size + 4096))
+	for off in 0 $((end / 2 & ~3)) $((end - 4)) $end; do wr $((DUMP + off)) 0xdeadbeef; done
+	wr $((ISP + 0x120)) $(( ($(rd $((ISP + 0x120))) & ~0x1f) | tap ))
+	wr $((ISP + 0x128)) $(( lines == 1 ? 0 : stride ))
+	wr $((ISP + 0x124)) $DUMP
+	[ -d $ISPDEV ] && echo $(printf '%x' $DUMP) > $ISPDEV/dump_addr	# re-arm per frame
+	set_bits $((ISP + 0x28)) "1 << 26"			# dump enable
+	usleep 200000
+	clr $((ISP + 0x28)) "1 << 26"
+	[ -d $ISPDEV ] && echo 0 > $ISPDEV/dump_addr
+	usleep 100000
+	echo "stock: raw markers (+0, middle, last word, after end): $(rd $DUMP)" \
+	     "$(rd $((DUMP + (end / 2 & ~3)))) $(rd $((DUMP + end - 4))) $(rd $((DUMP + end)))"
+	memcat $DUMP $size > $1
+	echo "stock: $1 ($(wc -c < $1) bytes, tap $tap, ${w}x$lines $bits-bit packed, stride $stride)"
+}
+
+# Stock VPSS bring-up replayed from $VPU_INIT (produced by scripts/stockemu.py with
+# its DDR allocation at 0xA3800000): channel 0 Y at 0xA3816000, C at 0xA3A14000.
+vpustock() {
+	vout=${1:-/tmp/nv12.bin}		# not "out": raw() sets that
+	y=0xa3816000 c=0xa3a14000
+	ysize=$((W * H))
+	[ -f $VPU_INIT ] || { echo "vpustock: no $VPU_INIT"; return 1; }
+	NOSTART=1 KEEP=1 raw /tmp/raw.bin > /dev/null || return 1
+	clr $((ISP + 0x28)) "1 << 26"			# raw dump off (shares the area)
+	memcat -z $y $((ysize))
+	memcat -z $c $((ysize / 2))
+	for a in $y $((y + 0x100000)) $c $((c + ysize / 2 - 4)); do wr $a 0xdeadbeef; done
+	n=0
+	while read off val rest; do
+		case $off in \#*|'') continue ;; esac
+		wr $((ISP + off)) $val
+		n=$((n + 1))
+	done < $VPU_INIT
+	echo "vpustock: $n writes from $VPU_INIT, +0x30 $(rd $((ISP + 0x30)))"
+	if [ -d $ISPDEV ]; then
+		# the replay writes +0x08 = 0x1e00 (stock ORs it into the mask Ispp_Init
+		# set; +0x08 is write-only, so the emulator saw 0): restore the mask
+		echo $(printf '%x' $(( ${ISPMASK:-0x7fffffb} | 0x1e00 ))) > $ISPDEV/mask
+		echo ${y#0x} > $ISPDEV/vpu_y
+		echo ${c#0x} > $ISPDEV/vpu_c
+		echo 0 > $ISPDEV/vpu_chn
+	fi
+	# Registers the stock interrupt handler sets at every ISPF END (vpu_hook_interrupt):
+	# YC mean output and SAD read address. Without them the mean/SAD DMA use address
+	# 0 and the first frame never ends, so set them once before starting (values of
+	# the second frame in the emulation, scripts/stockemu.py frames).
+	wr $((ISP + 0xed4)) 0xa3806000; wr $((ISP + 0xed8)) 0x00780000
+	wr $((ISP + 0xedc)) 0xa3808000; wr $((ISP + 0xee0)) 0x00f00000
+	wr $((ISP + 0x12dc)) 0xa3e10000; wr $((ISP + 0x12e0)) 0x000000f0
+	isp_input_on					# now start the ISP input (stock order)
+	usleep 300000
+	echo -n "vpustock: markers (Y0, Y+1M, C0, C end):"
+	for a in $y $((y + 0x100000)) $c $((c + ysize / 2 - 4)); do echo -n " $(rd $a)"; done
+	echo
+	echo "vpustock: DMA idle +0x14 $(rd $((ISP + 0x14))) +0x18 $(rd $((ISP + 0x18)))"
+	[ -d $ISPDEV ] && echo "vpustock: kickoff $(cat $ISPDEV/vpu_chn)" && cat $ISPDEV/counts
+	memcat $y $ysize > $vout
+	memcat $c $((ysize / 2)) >> $vout
+	echo "vpustock: $vout ($(wc -c < $vout) bytes, ${W}x${H} NV12)"
+	[ -n "$KEEP" ] && { echo "KEEP set: keeps running (cam-probe stop)"; return; }
+	stop
+}
+
+# How far did the dump get? Prints the first zero word in 256-byte steps (up to 64 KiB).
+dump_extent() {
+	o=0
+	while [ $o -lt 65536 ]; do
+		[ $(rd $((DUMP + o))) = 0x00000000 ] && break
+		o=$((o + 256))
+	done
+	echo "$o"
+}
+
+# Needs a running stream (KEEP=1 cam-probe raw). Does the dump DMA restart?
+rearm() {
+	memcat -z $DUMP 65536
+	set_bits $((ISP + 0x28)) "1 << 26"
+	wr $((ISP + 0x124)) $DUMP			# as handle_isp_interrupt does every frame
+	usleep 100000
+	echo "rearm by address write: data up to +$(dump_extent)"
+	memcat -z $DUMP 65536
+	clr $((ISP + 0x28)) "1 << 26"
+	usleep 50000
+	set_bits $((ISP + 0x28)) "1 << 26"
+	usleep 100000
+	echo "rearm by enable toggle: data up to +$(dump_extent)"
+	clr $((ISP + 0x28)) "1 << 26"
+}
+
+stop() {
+	i2ctransfer -y 0 w3@0x30 0x01 0x00 0x00
+	[ -e $SENSOR_DRV/$SENSOR ] || echo $SENSOR > $SENSOR_DRV/bind
+}
+
+case "$1" in
+	show)	show ;;
+	pins)	pins ;;
+	irq)	irq "$2" ;;
+	mclk)	mclk "$2" ;;
+	reset)	reset ;;
+	id)	id "$2" ;;
+	all)	show; pins; mclk "$2" && reset && id ;;
+	csi)	csi "$2" ;;
+	status)	status ;;
+	stream)	stream "$2" ;;
+	stop)	stop ;;
+	raw)	raw "$2" ;;
+	isp)	isp_status ;;
+	rearm)	rearm ;;
+	vpu)	vpu "$2" ;;
+	ispcmp)	ispcmp ;;
+	vpustock) vpustock "$2" ;;
+	stock)	stock "$2" ;;
+	own)	STOCK_INIT=$OWN_INIT; stock "$2" ;;
+	groups)	[ "$OWN" = 1 ] && STOCK_INIT=$OWN_INIT; groups ;;
+	snap)	snap ;;
+	ispreset) ispreset ;;
+	ispdump) ispdump "$2" ;;
+	dumpext) dumpext ;;
+	isr)	echo "mask $(cat $ISPDEV/mask) status $(cat $ISPDEV/status)"; cat $ISPDEV/counts ;;
+	bitscan) shift; bitscan "$@" ;;
+	*)	sed -n '4,/^$/p' "$0"; exit 1 ;;
+esac

@@ -1,0 +1,21 @@
+#!/bin/sh
+# BusyBox udhcpc hook: apply lease to $interface.
+case "$1" in
+deconfig)
+	ip addr flush dev "$interface" 2>/dev/null
+	ip link set "$interface" up
+	;;
+bound|renew)
+	ip addr flush dev "$interface" 2>/dev/null
+	ip addr add "$ip/${mask:-24}" ${broadcast:+broadcast $broadcast} dev "$interface"
+	if [ -n "$router" ]; then
+		ip route del default 2>/dev/null
+		for r in $router; do ip route add default via "$r" dev "$interface"; break; done
+	fi
+	: > /etc/resolv.conf
+	[ -n "$domain" ] && echo "search $domain" >> /etc/resolv.conf
+	for d in $dns; do echo "nameserver $d" >> /etc/resolv.conf; done
+	;;
+esac
+exit 0
+

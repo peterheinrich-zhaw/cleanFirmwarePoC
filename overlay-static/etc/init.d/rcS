@@ -1,0 +1,13 @@
+#!/bin/sh
+# Boot-time setup, run in the background by /init:
+# start cam-http (log in /tmp/cam-http.log), then home both camera axes
+# against their end stops and move them to the centre.
+[ -x /sbin/cam-http ] && cam-http >/tmp/cam-http.log 2>&1 &
+
+S=/sys/class/stepper
+[ -d $S/pan ] || exit 0
+for a in pan tilt; do echo 1 >$S/$a/home; done
+for a in pan tilt; do
+	while [ "$(cat $S/$a/moving)" = 1 ]; do usleep 100000; done
+done
+for a in pan tilt; do echo $(($(cat $S/$a/max_steps) / 2)) >$S/$a/target; done

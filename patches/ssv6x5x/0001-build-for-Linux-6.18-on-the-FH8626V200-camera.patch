@@ -1,0 +1,363 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: open-cam-fw <open-cam-fw@example.invalid>
+Date: Thu, 12 Nov 2026 01:00:05 -0800
+Subject: [PATCH] build for Linux 6.18 on the FH8626V200 camera
+
+- build: use ccflags-y for include paths (EXTRA_CFLAGS is gone)
+- fmac: adapt to the cfg80211 API of Linux 6.18
+- core: adapt to kernel API changes up to Linux 6.18
+---
+ Makefile               |  2 +-
+ config.mak             |  2 --
+ fmac/cfg_ops.c         | 31 ++++++++++++++++++-------------
+ fmac/fmac_mod_params.c |  6 ++++--
+ fmac/fmac_msg_tx.c     | 24 ++++++++++++------------
+ fmac/fmac_utils.c      |  2 +-
+ fmac/fmac_utils.h      |  2 +-
+ fmac/netdev_ops.c      |  6 +++---
+ ssvdevice/init.c       |  4 ++--
+ utils/debugfs.c        |  4 ++--
+ 10 files changed, 44 insertions(+), 39 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index 67869ee..d02faf7 100755
+--- a/Makefile
++++ b/Makefile
+@@ -9,7 +9,7 @@ SSV_DRV_PATH ?= $(PWD)
+ 
+ include $(KBUILD_TOP)/config.mak
+ 
+-EXTRA_CFLAGS := -I$(KBUILD_TOP) -I$(KBUILD_TOP)/include
++ccflags-y += -I$(KBUILD_TOP) -I$(KBUILD_TOP)/include
+ 
+ #------------------------------
+ # ssvdevice/
+diff --git a/config.mak b/config.mak
+index 80e33ce..a2d78fa 100755
+--- a/config.mak
++++ b/config.mak
+@@ -1,6 +1,4 @@
+ KVERSION="$(uname -r)"
+-EXTRA_CFLAGS := -I$(KBUILD_TOP) 
+-EXTRA_CFLAGS += -I$(KBUILD_TOP)/include 
+ 
+ CONFIG_SSV6X5X=m
+ 
+diff --git a/fmac/cfg_ops.c b/fmac/cfg_ops.c
+index a0afb1c..3af4c96 100755
+--- a/fmac/cfg_ops.c
++++ b/fmac/cfg_ops.c
+@@ -433,7 +433,7 @@ END:
+  *	when adding a group key.
+  */
+ static int ssv_cfg80211_add_key(struct wiphy *wiphy, struct net_device *netdev,
+-                                 u8 key_index, bool pairwise, const u8 *mac_addr,
++                                 int link_id, u8 key_index, bool pairwise, const u8 *mac_addr,
+                                  struct key_params *params)
+ {
+     struct ssv_softc *sc = wiphy_priv(wiphy);
+@@ -524,7 +524,7 @@ static int ssv_cfg80211_add_key(struct wiphy *wiphy, struct net_device *netdev,
+  *
+  */
+ static int ssv_cfg80211_get_key(struct wiphy *wiphy, struct net_device *netdev,
+-                                 u8 key_index, bool pairwise, const u8 *mac_addr,
++                                 int link_id, u8 key_index, bool pairwise, const u8 *mac_addr,
+                                  void *cookie,
+                                  void (*callback)(void *cookie, struct key_params*))
+ {
+@@ -538,7 +538,7 @@ static int ssv_cfg80211_get_key(struct wiphy *wiphy, struct net_device *netdev,
+  *	and @key_index, return -ENOENT if the key doesn't exist.
+  */
+ static int ssv_cfg80211_del_key(struct wiphy *wiphy, struct net_device *netdev,
+-                                 u8 key_index, bool pairwise, const u8 *mac_addr)
++                                 int link_id, u8 key_index, bool pairwise, const u8 *mac_addr)
+ {
+     struct ssv_softc *sc = wiphy_priv(wiphy);
+     struct ssv_vif *vif = netdev_priv(netdev);
+@@ -565,7 +565,7 @@ static int ssv_cfg80211_del_key(struct wiphy *wiphy, struct net_device *netdev,
+  */
+ static int ssv_cfg80211_set_default_key(struct wiphy *wiphy,
+                                          struct net_device *netdev,
+-                                         u8 key_index, bool unicast, bool multicast)
++                                         int link_id, u8 key_index, bool unicast, bool multicast)
+ {
+     SSV_LOG_DBG("[%s][%d]\n", __FUNCTION__, __LINE__);
+     return 0;
+@@ -576,7 +576,7 @@ static int ssv_cfg80211_set_default_key(struct wiphy *wiphy,
+  */
+ static int ssv_cfg80211_set_default_mgmt_key(struct wiphy *wiphy,
+                                               struct net_device *netdev,
+-                                              u8 key_index)
++                                              int link_id, u8 key_index)
+ {
+     SSV_LOG_DBG("[%s][%d]\n", __FUNCTION__, __LINE__);
+     return 0;
+@@ -622,7 +622,7 @@ RETRY_CONNECT:
+         key_params.key_len = sme->key_len;
+         key_params.seq_len = 0;
+         key_params.cipher = sme->crypto.cipher_group;
+-        ssv_cfg80211_add_key(wiphy, dev, sme->key_idx, false, NULL, &key_params);
++        ssv_cfg80211_add_key(wiphy, dev, 0, sme->key_idx, false, NULL, &key_params);
+     }
+     //SSV_LOG_DBG("auth_type %d\n",sme->auth_type);
+     //SSV_LOG_DBG("ciphers_pairwise 0x%x\n",sme->crypto.ciphers_pairwise[0]);
+@@ -767,9 +767,9 @@ static int ssv_cfg80211_add_station(struct wiphy *wiphy, struct net_device *dev,
+             sta->vif_idx = ssv_vif->drv_vif_index;
+             sta->vlan_idx = sta->vif_idx;
+             sta->qos = (params->sta_flags_set & BIT(NL80211_STA_FLAG_WME)) != 0;
+-            sta->ht = params->ht_capa ? 1 : 0;
++            sta->ht = params->link_sta_params.ht_capa ? 1 : 0;
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0)
+-            sta->vht = params->vht_capa ? 1 : 0;
++            sta->vht = params->link_sta_params.vht_capa ? 1 : 0;
+ #endif
+             sta->acm = 0;
+             sta->probe_timestamp = 0;
+@@ -1062,9 +1062,9 @@ static int ssv_cfg80211_change_station(struct wiphy *wiphy, struct net_device *d
+                     sta->vif_idx = ssv_vif->drv_vif_index;
+                     sta->vlan_idx = sta->vif_idx;
+                     sta->qos = (params->sta_flags_set & BIT(NL80211_STA_FLAG_WME)) != 0;
+-                    sta->ht = params->ht_capa ? 1 : 0;
++                    sta->ht = params->link_sta_params.ht_capa ? 1 : 0;
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0)
+-                    sta->vht = params->vht_capa ? 1 : 0;
++                    sta->vht = params->link_sta_params.vht_capa ? 1 : 0;
+ #endif
+                     sta->acm = 0;
+                     for (tid = 0; tid < NX_NB_TXQ_PER_STA; tid++) {
+@@ -1361,8 +1361,9 @@ err:
+  *	interface. This should reject the call when AP mode wasn't started.
+  */
+ static int ssv_cfg80211_change_beacon(struct wiphy *wiphy, struct net_device *dev,
+-                                       struct cfg80211_beacon_data *info)
++                                       struct cfg80211_ap_update *update)
+ {
++    struct cfg80211_beacon_data *info = &update->beacon;
+     struct ssv_softc *sc = wiphy_priv(wiphy);
+     struct ssv_vif *vif = netdev_priv(dev);
+     struct ssv_bcn *bcn = &vif->ap.bcn;
+@@ -1388,7 +1389,8 @@ static int ssv_cfg80211_change_beacon(struct wiphy *wiphy, struct net_device *de
+ /**
+  * * @stop_ap: Stop being an AP, including stopping beaconing.
+  */
+-static int ssv_cfg80211_stop_ap(struct wiphy *wiphy, struct net_device *dev)
++static int ssv_cfg80211_stop_ap(struct wiphy *wiphy, struct net_device *dev,
++                                 unsigned int link_id)
+ {
+     struct ssv_softc *sc = wiphy_priv(wiphy);
+     struct ssv_vif *ssv_vif = netdev_priv(dev);
+@@ -1491,6 +1493,7 @@ static struct ssv_vif *ssv_get_sc_to_vif(struct ssv_softc *sc)
+  */
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 6, 0)
+ static int ssv_cfg80211_set_monitor_channel(struct wiphy *wiphy,
++                                             struct net_device *dev,
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0)
+                                              struct cfg80211_chan_def *chandef
+ #else
+@@ -1585,7 +1588,7 @@ void ssv_cfg80211_mgmt_frame_register(struct wiphy *wiphy,
+  *	have changed. The actual parameter values are available in
+  *	struct wiphy. If returning an error, no value should be changed.
+  */
+-static int ssv_cfg80211_set_wiphy_params(struct wiphy *wiphy, u32 changed)
++static int ssv_cfg80211_set_wiphy_params(struct wiphy *wiphy, int radio_idx, u32 changed)
+ {
+     SSV_LOG_DBG("[%s][%d]\n", __FUNCTION__, __LINE__);
+     return 0;
+@@ -1603,6 +1606,7 @@ static int ssv_cfg80211_set_tx_power(struct wiphy *wiphy,
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0)
+                                       struct wireless_dev *wdev,
+ #endif
++                                      int radio_idx,
+                                       enum nl80211_tx_power_setting type, int mbm)
+ {
+     struct ssv_softc *sc = wiphy_priv(wiphy);
+@@ -1890,6 +1894,7 @@ static struct ssv_vif *ssv_get_first_up_vif(struct ssv_softc *sc)
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0)
+ static int ssv_cfg80211_get_channel(struct wiphy *wiphy,
+                                      struct wireless_dev *wdev,
++                                     unsigned int link_id,
+                                      struct cfg80211_chan_def *chandef)
+ #elif LINUX_VERSION_CODE >= KERNEL_VERSION(3, 6, 0)
+ static struct ieee80211_channel *ssv_cfg80211_get_channel(struct wiphy *wiphy,
+diff --git a/fmac/fmac_mod_params.c b/fmac/fmac_mod_params.c
+index 056c75d..7176072 100755
+--- a/fmac/fmac_mod_params.c
++++ b/fmac/fmac_mod_params.c
+@@ -62,7 +62,8 @@ extern struct ssv6xxx_cfg ssv_cfg;
+ #define IEEE80211_HE_PHY_CAP9_NOMIMAL_PKT_PADDING_0US           0x00
+ #define IEEE80211_HE_PHY_CAP9_NOMIMAL_PKT_PADDING_8US           0x40
+ #define IEEE80211_HE_PHY_CAP9_NOMIMAL_PKT_PADDING_16US          0x80
+-#define IEEE80211_HE_PHY_CAP9_NOMIMAL_PKT_PADDING_RESERVED      0xc0
++#define (IEEE80211_HE_PHY_CAP9_NOMINAL_PKT_PADDING_RESERVED <<
++                                            IEEE80211_HE_PHY_CAP9_NOMINAL_PKT_PADDING_POS)      0xc0
+ #define IEEE80211_HE_PHY_CAP9_NOMIMAL_PKT_PADDING_MASK          0xc0
+ #endif // 5.1
+ 
+@@ -897,7 +898,8 @@ int ssv_handle_dynparams(struct ssv_softc *sc, struct wiphy *wiphy)
+     he_cap->he_cap_elem.phy_cap_info[9] |= IEEE80211_HE_PHY_CAP9_NON_TRIGGERED_CQI_FEEDBACK |
+                                            IEEE80211_HE_PHY_CAP9_RX_FULL_BW_SU_USING_MU_WITH_COMP_SIGB |
+                                            IEEE80211_HE_PHY_CAP9_RX_FULL_BW_SU_USING_MU_WITH_NON_COMP_SIGB |
+-                                           IEEE80211_HE_PHY_CAP9_NOMIMAL_PKT_PADDING_RESERVED;
++                                           (IEEE80211_HE_PHY_CAP9_NOMINAL_PKT_PADDING_RESERVED <<
++                                            IEEE80211_HE_PHY_CAP9_NOMINAL_PKT_PADDING_POS);
+ 
+     // Starting from version v31 more HE_ER_SU modulations is supported
+     if (__MDM_VERSION(phy_vers) > 30) {
+diff --git a/fmac/fmac_msg_tx.c b/fmac/fmac_msg_tx.c
+index cea573d..a49a4ef 100755
+--- a/fmac/fmac_msg_tx.c
++++ b/fmac/fmac_msg_tx.c
+@@ -962,7 +962,7 @@ int ssv_send_me_sta_add(struct ssv_softc *sc, struct station_parameters *params,
+                          const u8 *mac, u8 inst_nbr, struct me_sta_add_cfm *cfm)
+ {
+     struct me_sta_add_req *req;
+-    u8 *ht_mcs = (u8 *)&params->ht_capa->mcs;
++    u8 *ht_mcs = (u8 *)&params->link_sta_params.ht_capa->mcs;
+     int i;
+ 
+ 
+@@ -976,13 +976,13 @@ int ssv_send_me_sta_add(struct ssv_softc *sc, struct station_parameters *params,
+     /* Set parameters for the MM_STA_ADD_REQ message */
+     memcpy(&(req->mac_addr.array[0]), mac, ETH_ALEN);
+ 
+-    req->rate_set.length = params->supported_rates_len;
+-    for (i = 0; i < params->supported_rates_len; i++)
+-        req->rate_set.array[i] = params->supported_rates[i];
++    req->rate_set.length = params->link_sta_params.supported_rates_len;
++    for (i = 0; i < params->link_sta_params.supported_rates_len; i++)
++        req->rate_set.array[i] = params->link_sta_params.supported_rates[i];
+ 
+     req->flags = 0;
+-    if (params->ht_capa) {
+-        const struct ieee80211_ht_cap *ht_capa = params->ht_capa;
++    if (params->link_sta_params.ht_capa) {
++        const struct ieee80211_ht_cap *ht_capa = params->link_sta_params.ht_capa;
+ 
+         req->flags |= STA_HT_CAPA;
+         req->ht_cap.ht_capa_info = cpu_to_le16(ht_capa->cap_info);
+@@ -1007,8 +1007,8 @@ int ssv_send_me_sta_add(struct ssv_softc *sc, struct station_parameters *params,
+     }
+ 
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0)
+-    if (params->vht_capa) {
+-        const struct ieee80211_vht_cap *vht_capa = params->vht_capa;
++    if (params->link_sta_params.vht_capa) {
++        const struct ieee80211_vht_cap *vht_capa = params->link_sta_params.vht_capa;
+ 
+         req->flags |= STA_VHT_CAPA;
+         req->vht_cap.vht_capa_info = cpu_to_le32(vht_capa->vht_cap_info);
+@@ -1020,8 +1020,8 @@ int ssv_send_me_sta_add(struct ssv_softc *sc, struct station_parameters *params,
+ #endif
+ 
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)) || defined(IEEE80211_HE_MAC_CAP2_TRS)
+-    if (params->he_capa) {
+-        const struct ieee80211_he_cap_elem *he_capa = params->he_capa;
++    if (params->link_sta_params.he_capa) {
++        const struct ieee80211_he_cap_elem *he_capa = params->link_sta_params.he_capa;
+         struct ieee80211_he_mcs_nss_supp *mcs_nss_supp =
+                                 (struct ieee80211_he_mcs_nss_supp *)(he_capa + 1);
+ 
+@@ -1048,9 +1048,9 @@ int ssv_send_me_sta_add(struct ssv_softc *sc, struct station_parameters *params,
+         req->flags |= STA_MFP_CAPA;
+ 
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0)
+-    if (params->opmode_notif_used) {
++    if (params->link_sta_params.opmode_notif_used) {
+         req->flags |= STA_OPMOD_NOTIF;
+-        req->opmode = params->opmode_notif;
++        req->opmode = params->link_sta_params.opmode_notif;
+     }
+ #endif
+ 
+diff --git a/fmac/fmac_utils.c b/fmac/fmac_utils.c
+index fe2a721..235fd99 100644
+--- a/fmac/fmac_utils.c
++++ b/fmac/fmac_utils.c
+@@ -350,7 +350,7 @@ int ssv_xmit_deauth_frame(struct ssv_softc *sc, struct ssv_vif *vif, struct ssv_
+ 
+ }
+ 
+-struct sk_buff *ssv_build_nulldata_frame(u8 *da, u8 *sa, u8 *bssid, bool qos, bool fromds)
++struct sk_buff *ssv_build_nulldata_frame(const u8 *da, const u8 *sa, const u8 *bssid, bool qos, bool fromds)
+ {
+     struct ieee80211_qos_hdr *nullfunc;
+     struct sk_buff *skb;
+diff --git a/fmac/fmac_utils.h b/fmac/fmac_utils.h
+index ac450e6..9148bd5 100644
+--- a/fmac/fmac_utils.h
++++ b/fmac/fmac_utils.h
+@@ -178,7 +178,7 @@ void ssv_rxtput_calculation(struct ssv_softc *sc, u32 len, u32 seq_no);
+ void ssv_hex_dump(unsigned char *data, int len);
+ int ssv_xmit_deauth_frame(struct ssv_softc *sc, struct ssv_vif *vif, struct ssv_sta *sta, 
+         u8 *da, u8 *sa, u8 *bssid, u16 reason);
+-struct sk_buff *ssv_build_nulldata_frame(u8 *da, u8 *sa, u8 *bssid, bool qos, bool fromds);
++struct sk_buff *ssv_build_nulldata_frame(const u8 *da, const u8 *sa, const u8 *bssid, bool qos, bool fromds);
+ int ssv_fmac_hci_tx(struct ssv_softc *sc, struct sk_buff *skb, int txqid, 
+         bool force_trigger,u32 tx_flags);
+ enum data_frame_types ssv_get_data_frame_type(struct sk_buff *skb);
+diff --git a/fmac/netdev_ops.c b/fmac/netdev_ops.c
+index fa6afc3..cfe43eb 100644
+--- a/fmac/netdev_ops.c
++++ b/fmac/netdev_ops.c
+@@ -578,14 +578,14 @@ struct wireless_dev *ssv_interface_add(struct ssv_softc *sc,
+ 
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 9, 0))
+     if (type == NL80211_IFTYPE_AP_VLAN)
+-        memcpy(ndev->dev_addr, params->macaddr, ETH_ALEN);
++        eth_hw_addr_set(ndev, params->macaddr);
+     else {
+ #endif
+         // sc->wphy->perm_addr == sc->macaddr[0][0]
+         if (0 == vif->drv_vif_index)
+-            memcpy(ndev->dev_addr, sc->wiphy->perm_addr, ETH_ALEN);
++            eth_hw_addr_set(ndev, sc->wiphy->perm_addr);
+         else
+-            memcpy(ndev->dev_addr, (const void *)&sc->maddr[1][0], ETH_ALEN);
++            eth_hw_addr_set(ndev, (const u8 *)&sc->maddr[1][0]);
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 9, 0))
+     }
+ #endif
+diff --git a/ssvdevice/init.c b/ssvdevice/init.c
+index 0409b95..fe71f8f 100755
+--- a/ssvdevice/init.c
++++ b/ssvdevice/init.c
+@@ -87,7 +87,7 @@ extern int ssv_pre_allocate_rx_skb_free_all(void);
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0))
+ static inline void house_keeping_timer_hdl(struct timer_list *in_timer)
+ {
+-	struct ssv_timer_list *ptimer = from_timer(ptimer, in_timer, timer);
++	struct ssv_timer_list *ptimer = timer_container_of(ptimer, in_timer, timer);
+ 	ptimer->function((unsigned long)ptimer->arg);
+ }
+ #endif
+@@ -282,7 +282,7 @@ int ssv6xxx_housekeeping_deinit(struct ssv_hw *ssv_hw)
+     struct ssv_softc *sc = ssv_hw->sc;
+     // remove house keeping
+     sc->fw_reset_run= false;
+-    del_timer_sync(&ssv_hw->house_keeping.time.timer);
++    timer_delete_sync(&ssv_hw->house_keeping.time.timer);
+     destroy_workqueue(sc->fw_reset_wq);
+     return 0;
+ }
+diff --git a/utils/debugfs.c b/utils/debugfs.c
+index 3645a65..8401cfa 100755
+--- a/utils/debugfs.c
++++ b/utils/debugfs.c
+@@ -42,7 +42,7 @@ static struct proc_dir_entry *__ssv_procfs;
+ 
+ #define	READ_CHUNK	32 
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(3,10,0)
+-#define PDE_DATA(inode) ({ \
++#define pde_data(inode) ({ \
+     struct proc_dir_entry *dp = PDE(inode); \
+     data = dp->data; })
+ #endif
+@@ -195,7 +195,7 @@ static int ssv_cmd_submit(struct ssv_cmd_data *cmd_data, char *cmd)
+ 
+ static int ssv6xxx_cmd_file_open(struct inode *inode, struct file *filp)
+ {
+-    void *data = PDE_DATA(inode);
++    void *data = pde_data(inode);
+ 
+     filp->private_data = data;
+     return 0;

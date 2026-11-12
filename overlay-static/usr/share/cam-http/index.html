@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FH8626 camera</title>
+<style>
+:root{color-scheme:dark;--bg:#111;--fg:#ddd;--btn:#2a2a2a;--on:#3b6ea8}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px system-ui,sans-serif}
+img{display:block;width:100%;height:auto;background:#000}
+.bar{display:flex;flex-wrap:wrap;gap:16px;align-items:center;padding:12px 16px}
+.pad{display:grid;grid-template-columns:repeat(3,48px);grid-template-rows:repeat(3,48px);gap:4px}
+button{background:var(--btn);color:var(--fg);border:0;border-radius:6px;font-size:18px;
+ touch-action:none;user-select:none;-webkit-user-select:none;cursor:pointer}
+button:active,button.on{background:var(--on)}
+.grp{display:flex;gap:4px}.grp button{font-size:14px;padding:10px 12px}
+#st{font:12px ui-monospace,monospace;opacity:.8;white-space:pre}
+</style></head>
+<body>
+<img src="/stream" alt="camera">
+<div class="bar">
+ <div class="pad">
+  <span></span><button data-a="tilt" data-d="1" title="tilt">&#9650;</button><span></span>
+  <button data-a="pan" data-d="-1" title="pan">&#9664;</button>
+  <button id="ctr" title="centre">&#9679;</button>
+  <button data-a="pan" data-d="1" title="pan">&#9654;</button>
+  <span></span><button data-a="tilt" data-d="-1" title="tilt">&#9660;</button><span></span>
+ </div>
+ <div class="grp" id="ir">
+  <button data-m="auto">Auto</button><button data-m="day">Day</button><button data-m="night">Night</button>
+ </div>
+ <div class="grp"><button id="home" title="run both axes to the end stops, then 0">Home</button></div>
+ <div id="st"></div>
+</div>
+<script>
+const M = {pan: 8100, tilt: 1140};
+const st = document.getElementById('st');
+function show(s) {
+  M.pan = s.pan_max; M.tilt = s.tilt_max;
+  st.textContent = `pan ${s.pan}/${s.pan_max}  tilt ${s.tilt}/${s.tilt_max}\n` +
+    `${s.night ? 'night' : 'day'}  light ${s.light} (night >= ${s.night_threshold}, day <= ${s.day_threshold})`;
+  document.querySelectorAll('#ir button').forEach(b => b.classList.toggle('on', b.dataset.m === s.ir_mode));
+}
+const q = u => fetch(u).then(r => r.json()).then(show).catch(() => {});
+document.querySelectorAll('[data-a]').forEach(b => {
+  const a = b.dataset.a, d = +b.dataset.d;
+  // hold to move: run towards the end of the axis, stop on release
+  b.onpointerdown = e => { b.setPointerCapture(e.pointerId); q(`/ptz?${a}=${d > 0 ? M[a] : 0}`); };
+  b.onpointerup = b.onpointercancel = () => q('/ptz?stop=1');
+});
+document.getElementById('ctr').onclick = () => q('/ptz?center=1');
+document.getElementById('home').onclick = () => q('/ptz?home=1');
+document.querySelectorAll('#ir button').forEach(b => b.onclick = () => q('/ir?mode=' + b.dataset.m));
+q('/status'); setInterval(() => q('/status'), 2000);
+</script>
+</body></html>

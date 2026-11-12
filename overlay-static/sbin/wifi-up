@@ -1,0 +1,10 @@
+#!/bin/sh
+# usage: wifi-up [ifname]   (needs /etc/wpa_supplicant.conf)
+IF=${1:-wlan0}
+[ -e /sys/class/net/$IF ] || modprobe ssv6x5x || exit 1
+for i in 1 2 3 4 5 6 7 8 9 10; do [ -e /sys/class/net/$IF ] && break; sleep 1; done
+ip link set "$IF" up || exit 1
+mkdir -p /var/run/wpa_supplicant /tmp
+wpa_supplicant -B -i "$IF" -c /etc/wpa_supplicant.conf -P /var/run/wpa_supplicant-$IF.pid || exit 1
+udhcpc -i "$IF" -b -t 10 -T 3 -s /usr/share/udhcpc/default.script -x hostname:fh8626-cam
+

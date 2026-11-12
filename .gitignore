@@ -1,0 +1,12 @@
+# downloaded upstream tarballs and the development trees (own local git repos)
+/dl/
+/work/
+/build/
+/flash_image.bin
+/rootfs/root
+.DS_Store
+.env/
+fh8626_2nd_stage/*.o
+fh8626_2nd_stage/*.elf
+fh8626_2nd_stage/*.bin
+
