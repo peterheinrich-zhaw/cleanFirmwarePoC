@@ -457,7 +457,7 @@ For Wi-Fi the HTTP server sends 10 fps at quality 60 by default.
 
 <!-- IMAGE: a full-resolution MJPEG frame from the camera -->
 
-![MJPEG frame](images/mjpeg-frame.jpg)
+![MJPEG frame](Browser_Stream.png)
 
 ---
 
