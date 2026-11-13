@@ -16,7 +16,12 @@ missing.
 
 <!-- IMAGE: photo of the opened camera with the board, UART wires and SPI clip -->
 
-![The camera under test](images/camera-board.jpg)
+<p float="left">
+  <img src="Camera.png" width="300" />
+  <img src="PCB_Front.png" width="300" /> 
+  <img src="PCB_Back.png" width="300" />
+</p>
+
 
 ---
 
