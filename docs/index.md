@@ -80,10 +80,6 @@ project tests whether an AI agent can do most of it, so that it might scale.
 | Actuators    | Two 4-coil stepper motors (pan, tilt), latching IR-cut filter, IR LEDs, white LED                                                        |
 | Debug access | UART pads at 115200 baud; no JTAG. The flash can be reprogrammed with an external SPI programmer, so a bad image never bricks the board. |
 
-<!-- IMAGE: board photo with the SoC, flash, sensor connector and UART pads labelled -->
-
-![Board overview](images/board-annotated.jpg)
-
 ### The vendor firmware
 
 | Layer        | Vendor firmware                                                                                  |
@@ -154,9 +150,11 @@ current kernel.
    The human ran them and pasted the output back. One session usually answered several
    questions at once.
 
-<!-- IMAGE: diagram of the loop: agent (analysis, code, experiment) → human (flash, run, observe) → agent -->
 
-![Human-in-the-loop workflow](images/workflow-loop.png)
+![Board overview](Lab_Setup.png)
+
+Lab setup with the camera's UART and SPI-Flash-Chip directly connected to a Raspberry Pi 3B as means to
+access the console and update the flash.
 
 ---
 
