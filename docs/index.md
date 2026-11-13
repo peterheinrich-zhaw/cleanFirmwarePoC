@@ -501,8 +501,6 @@ Every line was first checked on the board with `devmem`.
 
 <!-- IMAGE: complete boot log from the boot ROM to the shell -->
 
-![Boot log](images/boot-log.png)
-
 ### Flash layout (8 MiB)
 
 | Offset   | Size    | Content                                                          |
