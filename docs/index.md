@@ -175,8 +175,6 @@ that the boot ROM copies into on-chip SRAM at 0x10008000.
 
 <!-- IMAGE: first UART log with "Use nor flash.", checkpoint digits and "Hello World" -->
 
-![First UART output](images/uart-first-characters.png)
-
 ### 2. Flash image format and boot ROM
 
 The boot ROM only starts code from a flash image with the right structure. That format
@@ -327,8 +325,6 @@ SC2336 ──MIPI 2 lanes──▶ CSI-2 host ─▶ MIPI wrap ─▶ ISP ─▶
 
 <!-- IMAGE: block diagram of the pipeline with register bases -->
 
-![Camera pipeline](images/camera-pipeline.png)
-
 ### Step 1: sensor on I2C
 
 - I2C0 needed the pinmux (pads 5/6 to function 0), its clock gate open and a correct
@@ -391,8 +387,6 @@ The final list has **1,044 writes, all computed from the frame geometry or found
 bisection, with no vendor tuning table**.
 
 <!-- IMAGE: progression of frames: 754-line stripes, overexposed grey, first colour, final image -->
-
-![From the first stripes to the final image](images/camera-progression.jpg)
 
 Key findings about the ISP interrupt (status +0x04, enable +0x08, `GIC_SPI 7`):
 
@@ -460,8 +454,6 @@ For Wi-Fi the HTTP server sends 10 fps at quality 60 by default.
 
 <!-- IMAGE: a full-resolution MJPEG frame from the camera -->
 
-![MJPEG frame](Browser_Stream.png)
-
 ---
 
 ## Motors, IR-cut, LEDs and key
@@ -489,13 +481,8 @@ Every line was first checked on the board with `devmem`.
   the day threshold when the camera falls back to night too soon.
 - **Web page.** The HTTP server's page has a hold-to-move pan/tilt pad.
 
-<!-- IMAGE: screenshot of the web page with stream, pan/tilt pad and day/night buttons -->
+![MJPEG frame](Browser_Stream.png)
 
-![Web interface](images/web-ui.png)
-
-<!-- IMAGE: night-mode frame with IR illumination -->
-
-![Night mode](images/night-mode.jpg)
 
 ---
 
